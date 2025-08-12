@@ -1,0 +1,1016 @@
+import faulthandler
+import logging
+import os
+import signal
+import time
+from http import HTTPStatus
+
+from types import SimpleNamespace
+from typing import Optional, Union, List, Any, NamedTuple, Tuple
+
+import zmq
+import numpy as np
+import psutil
+import setproctitle
+import torch
+import torch.distributed as dist
+
+
+from dataclasses import dataclass, field
+
+import threading as td
+import multiprocessing as mp
+from torch.cuda.streams import ExternalStream
+
+from sglang.semi_pd.utils import InstanceRole
+from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ImageInputs, Req
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.utils import validate_input_length
+from sglang.srt.server_args import PortArgs, SemiPDPortArgs, ServerArgs
+from sglang.srt.utils import (
+    configure_logger,
+    get_bool_env_var,
+    set_gpu_proc_affinity,
+    suppress_other_loggers,
+    broadcast_pyobj, 
+    get_zmq_socket
+)
+from sglang.utils import get_exception_traceback
+
+from sglang.srt.managers.io_struct import (
+    BatchProcessPrefillResultReq,
+    FlushCacheReq,
+    GetNextPrefillBatchInput,
+    GetNextPrefillBatchOutput,
+    TokenizedGenerateReqInput,
+)
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.scheduler import EmbeddingBatchResult, GenerationBatchResult
+
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.mem_cache.memory_pool import (
+    DoubleSparseTokenToKVPool,
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+    ReqToTokenPool,
+    TokenToKVPoolAllocator,
+)
+
+from .pdmux_context import create_greenctx_stream_by_percent_py
+
+# Test retract decode for debugging purposes
+TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
+
+logger = logging.getLogger(__name__)
+
+
+class SemiPDScheduler(Scheduler):
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        gpu_id: int,
+        tp_rank: int,
+        dp_rank: Optional[int],
+        bypass_load_weight: bool = False,
+        instance_role: InstanceRole = InstanceRole.OTHER,
+    ):
+        super().__init__(
+            server_args,
+            port_args,
+            gpu_id,
+            tp_rank,
+            dp_rank,
+            bypass_load_weight,
+            instance_role,
+        )
+
+    def add_to_waiting_queue(self, req: Req):
+        if req.is_retracted:
+            self.waiting_queue.insert(0, req)
+        else:
+            self.waiting_queue.append(req)
+
+    def handle_generate_request(
+        self,
+        recv_req: TokenizedGenerateReqInput,
+    ):
+        """
+        SemiPD changes:
+          - disable grammar
+          - handle retracted requests
+        """
+        logger.info(f"New request {recv_req.rid}, #tokens: {len(recv_req.input_ids)}")
+
+        # Create a new request
+        if (
+            recv_req.session_params is None
+            or recv_req.session_params.id is None
+            or recv_req.session_params.id not in self.sessions
+        ):
+
+            if recv_req.input_embeds is not None:
+                # Generate fake input_ids based on the length of input_embeds
+                seq_length = len(recv_req.input_embeds)
+                fake_input_ids = [1] * seq_length
+                recv_req.input_ids = fake_input_ids
+
+            # Handle custom logit processor passed to the request
+            custom_logit_processor = recv_req.custom_logit_processor
+            if (
+                not self.server_args.enable_custom_logit_processor
+                and custom_logit_processor is not None
+            ):
+                logger.warning(
+                    "The SGLang server is not configured to enable custom logit processor."
+                    "The custom logit processor passed in will be ignored."
+                    "Please set --enable-custom-logits-processor to enable this feature."
+                )
+                custom_logit_processor = None
+
+            req = Req(
+                recv_req.rid,
+                recv_req.input_text,
+                recv_req.input_ids,
+                recv_req.sampling_params,
+                return_logprob=recv_req.return_logprob,
+                top_logprobs_num=recv_req.top_logprobs_num,
+                stream=recv_req.stream,
+                lora_path=recv_req.lora_path,
+                input_embeds=recv_req.input_embeds,
+                custom_logit_processor=custom_logit_processor,
+                return_hidden_states=recv_req.return_hidden_states,
+                eos_token_ids=self.model_config.hf_eos_token_id,
+            )
+            req.tokenizer = self.tokenizer
+
+            if (
+                recv_req.session_params is not None
+                and recv_req.session_params.id is not None
+            ):
+                req.finished_reason = FINISH_ABORT(
+                    f"Invalid request: session id {recv_req.session_params.id} does not exist"
+                )
+                # SemiPD
+                self.add_to_waiting_queue(req)
+                return
+        else:
+            # Create a new request from a previous session
+            session = self.sessions[recv_req.session_params.id]
+            req = session.create_req(recv_req, self.tokenizer)
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                # SemiPD
+                self.add_to_waiting_queue(req)
+                return
+
+        # Handle multimodal inputs
+        if recv_req.image_inputs is not None:
+            image_inputs = ImageInputs.from_dict(recv_req.image_inputs)
+            # Expand a single image token into multiple dummy tokens for receiving image embeddings
+            req.origin_input_ids = self.pad_input_ids_func(
+                req.origin_input_ids, image_inputs
+            )
+            req.extend_image_inputs(image_inputs)
+
+            if len(req.origin_input_ids) >= self.max_req_input_len:
+                error_msg = (
+                    "Multimodal prompt is too long after expanding multimodal tokens. "
+                    f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                )
+                logger.error(error_msg)
+                req.origin_input_ids = [0]
+                req.image_inputs = None
+                req.sampling_params.max_new_tokens = 0
+                req.finished_reason = FINISH_ABORT(
+                    error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+                )
+                # SemiPD
+                self.add_to_waiting_queue(req)
+                return
+
+        # Validate prompts length
+        error_msg = validate_input_length(
+            req,
+            self.max_req_input_len,
+            self.server_args.allow_auto_truncate,
+        )
+        if error_msg:
+            req.origin_input_ids = [0]
+            req.sampling_params.max_new_tokens = 0
+            # SemiPD
+            self.add_to_waiting_queue(req)
+            return
+
+        # Copy more attributes
+        if recv_req.logprob_start_len == -1:
+            # By default, only return the logprobs for output tokens
+            req.logprob_start_len = len(req.origin_input_ids) - 1
+        else:
+            req.logprob_start_len = recv_req.logprob_start_len
+
+        req.sampling_params.max_new_tokens = min(
+            (
+                req.sampling_params.max_new_tokens
+                if req.sampling_params.max_new_tokens is not None
+                else 1 << 30
+            ),
+            self.max_req_len - len(req.origin_input_ids) - 1,
+        )
+
+        # Init grammar cache for this request
+        add_to_grammar_queue = False
+        if (
+            req.sampling_params.json_schema is not None
+            or req.sampling_params.regex is not None
+            or req.sampling_params.ebnf is not None
+            or req.sampling_params.structural_tag is not None
+        ):
+            assert self.grammar_backend is not None
+            if req.sampling_params.json_schema is not None:
+                key = ("json", req.sampling_params.json_schema)
+            elif req.sampling_params.regex is not None:
+                key = ("regex", req.sampling_params.regex)
+            elif req.sampling_params.ebnf is not None:
+                key = ("ebnf", req.sampling_params.ebnf)
+            elif req.sampling_params.structural_tag:
+                key = ("structural_tag", req.sampling_params.structural_tag)
+
+            req.grammar = self.grammar_backend.get_cached_value(key)
+            if not req.grammar:
+                req.grammar = self.grammar_backend.get_future_value(key)
+                add_to_grammar_queue = True
+
+        if add_to_grammar_queue:
+            # SemiPD
+            raise NotImplementedError("Grammar is not supported in SemiPD mode")
+        else:
+            # SemiPD
+            self.add_to_waiting_queue(req)
+
+class SemiPDPrefillScheduler(SemiPDScheduler):
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        gpu_id: int,
+        tp_rank: int,
+        dp_rank: Optional[int],
+        bypass_load_weight: bool = False,
+    ):
+        super().__init__(
+            server_args,
+            port_args,
+            gpu_id,
+            tp_rank,
+            dp_rank,
+            bypass_load_weight,
+            InstanceRole.PREFILL,
+        )
+
+        self.enable_overlap = False
+        self.chunked_rid = None
+
+        if self.attn_tp_rank == 0:
+            context = zmq.Context(2)
+            self.send_to_d_instance = get_zmq_socket(
+                context, zmq.PUSH, port_args.d_scheduler_input_ipc_name, False
+            )
+            self.bridge_socket = get_zmq_socket(
+                context, zmq.PULL, port_args.bridge_ipc_name, True
+            )
+        else:
+            self.send_to_d_instance = SimpleNamespace(send_pyobj=lambda x: None)
+            self.bridge_socket = SimpleNamespace(recv_pyobj=lambda: None)
+
+    def to_extend_batch(self, resp: GetNextPrefillBatchOutput):
+        can_run_list = [r for r in self.waiting_queue if r.rid in resp.rids]
+        # Sort by the order of resp.rids
+        can_run_list.sort(key=lambda r: resp.rids.index(r.rid))
+
+        if self.chunked_rid != resp.chunked_rid:
+            # Last chunked req has finished prefilling, remove it from waiting queue
+            new_waiting_queue = []
+            for r in self.waiting_queue:
+                if r.rid == self.chunked_rid:
+                    continue
+                if r.rid in resp.rids and r.rid != resp.chunked_rid:
+                    continue
+                new_waiting_queue.append(r)
+            self.waiting_queue = new_waiting_queue
+            self.chunked_rid = resp.chunked_rid
+        else:
+            self.waiting_queue = [
+                r
+                for r in self.waiting_queue
+                if r.rid not in resp.rids or r.rid == resp.chunked_rid
+            ]
+
+        for i, r in enumerate(can_run_list):
+            assert r.rid == resp.rids[i]
+            r.extend_input_len = resp.extend_input_lens[i]
+            req_pool_idx = resp.req_pool_indices[i]
+            pre_len = resp.prefix_lens[i]
+            r.prefix_indices = self.req_to_token_pool.req_to_token[
+                req_pool_idx, :pre_len
+            ]
+            r.fill_ids = r.origin_input_ids[: pre_len + r.extend_input_len]
+
+        batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+            self.server_args.enable_custom_logit_processor,
+        )
+        batch.prepare_for_extend(pre_allocated_req_pool_indices=resp.req_pool_indices)
+        return batch
+
+    def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        resp = None
+        if self.waiting_queue and self.attn_tp_rank == 0:
+            n_prefill_tokens = 0
+            candidates = []
+            for r in self.waiting_queue:
+                if n_prefill_tokens > self.server_args.chunked_prefill_size:
+                    break
+                n_prefill_tokens += len(r.origin_input_ids)
+                candidates.append(r.rid)
+
+            req = GetNextPrefillBatchInput(rids=candidates)
+            logger.info(f"Send request to D worker: {req}")
+            self.send_to_d_instance.send_pyobj(req)
+            resp = self.bridge_socket.recv_pyobj()
+            logger.info(f"Recv response from D worker: {resp}")
+            assert isinstance(
+                resp, GetNextPrefillBatchOutput
+            ), f"Expected GetNextPrefillBatchOutput, but got {type(resp)}"
+
+        if self.attn_tp_size > 1:
+            attn_tp_rank_0 = self.dp_rank * self.attn_tp_size
+            resp = broadcast_pyobj(
+                [resp],
+                self.attn_tp_rank,
+                self.attn_tp_cpu_group,
+                src=attn_tp_rank_0,
+            )[0]
+
+        ret = None
+        if resp and len(resp.rids) > 0:
+            ret = self.to_extend_batch(resp)
+
+        # Handle DP attention
+        if self.server_args.enable_dp_attention:
+            ret, _ = self.prepare_dp_attn_batch(ret)
+
+        return ret
+
+    def process_batch_result_prefill(
+        self,
+        batch: ScheduleBatch,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+    ):
+        next_token_logits = None
+        if result.logits_output is not None:
+            next_token_logits = result.logits_output.next_token_logits.cpu().numpy()
+
+        req = BatchProcessPrefillResultReq(
+            next_token_ids=result.next_token_ids.tolist(),
+            next_token_logits=next_token_logits,
+        )
+
+        self.send_to_d_instance.send_pyobj(req)
+
+    def flush_cache_wrapped(self, recv_req: FlushCacheReq):
+        logger.info("Ignore flush cache request")
+    
+
+
+
+class SemiPDDecodeScheduler(SemiPDScheduler):
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        gpu_id: int,
+        tp_rank: int,
+        dp_rank: Optional[int],
+        bypass_load_weight: bool = False,
+    ):
+        super().__init__(
+            server_args,
+            port_args,
+            gpu_id,
+            tp_rank,
+            dp_rank,
+            False,
+            InstanceRole.DECODE,
+        )
+
+        self._request_dispatcher._mapping.extend(
+            [
+                (GetNextPrefillBatchInput, self.get_next_prefill_batch),
+                (BatchProcessPrefillResultReq, self.process_prefill_result),
+            ]
+        )
+
+        # For requests that has been sent to the prefill scheduler but not yet finished.
+        self.scheduled_prefill_batches: List[ScheduleBatch] = []
+
+        if self.attn_tp_rank == 0:
+            context = zmq.Context(2)
+
+            assert isinstance(port_args, SemiPDPortArgs)
+            self.bridge_socket = get_zmq_socket(
+                context, zmq.PUSH, port_args.bridge_ipc_name, False
+            )
+            self.send_to_p_instance = get_zmq_socket(
+                context, zmq.PUSH, port_args.p_scheduler_input_ipc_name, False
+            )
+        else:
+            self.bridge_socket = SimpleNamespace(send_pyobj=lambda x: None)
+            self.send_to_p_instance = SimpleNamespace(send_pyobj=lambda x: None)
+
+    def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+        """
+        Semi-PD changes:
+          - add the retracted requests to the prefill scheduler
+        """
+        initial_bs = batch.batch_size()
+
+        batch.filter_batch()
+        if batch.is_empty():
+            batch.batch_is_full = False
+            return batch
+
+        # Check if decode out of memory
+        if not batch.check_decode_mem(self.decode_mem_cache_buf_multiplier) or (
+            TEST_RETRACT and batch.batch_size() > 10
+        ):
+            old_ratio = self.new_token_ratio
+
+            retracted_reqs, new_token_ratio = batch.retract_decode(self.server_args)
+            self.new_token_ratio = new_token_ratio
+
+            logger.info(
+                "Decode out of memory happened. "
+                f"#retracted_reqs: {len(retracted_reqs)}, "
+                f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
+            )
+
+            # Semi-PD
+            for req in retracted_reqs:
+                req: Req
+                message = TokenizedGenerateReqInput(
+                    rid=req.rid,
+                    input_text=req.origin_input_text + req.decoded_text,
+                    input_ids=req.origin_input_ids + req.output_ids,
+                    image_inputs=req.image_inputs,
+                    sampling_params=req.sampling_params,
+                    return_logprob=req.return_logprob,
+                    logprob_start_len=req.extend_logprob_start_len,
+                    top_logprobs_num=req.top_logprobs_num,
+                    token_ids_logprob=req.token_ids_logprob,
+                    stream=req.stream,
+                    lora_path=req.lora_path,
+                    input_embeds=req.input_embeds,
+                    custom_logit_processor=req.custom_logit_processor,
+                    return_hidden_states=req.return_hidden_states,
+                    is_retracted=True,
+                )
+
+                self.waiting_queue.insert(0, req)
+                self.send_to_p_instance.send_pyobj(message)
+        else:
+            self.new_token_ratio = max(
+                self.new_token_ratio - self.new_token_ratio_decay,
+                self.min_new_token_ratio,
+            )
+
+        if batch.batch_size() < initial_bs:
+            batch.batch_is_full = False
+
+        # Update batch tensors
+        batch.prepare_for_decode()
+        return batch
+
+    def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        if not self.running_batch.is_empty():
+            self.running_batch = self.update_running_batch(self.running_batch)
+            ret = self.running_batch if not self.running_batch.is_empty() else None
+        else:
+            ret = None
+
+        # Handle DP attention
+        if self.server_args.enable_dp_attention:
+            ret, _ = self.prepare_dp_attn_batch(ret)
+
+        return ret
+
+    def get_new_batch_prefill(self, rids: List[str]) -> Optional[ScheduleBatch]:
+        """
+        Semi-PD changes:
+          - keep scheduled prefill batches in scheduled_prefill_batches
+          - disable mixed-style chunked prefill
+          - skip requests that not in rids
+        """
+        # Check if the grammar is ready in the grammar queue
+        if self.grammar_queue:
+            self.move_ready_grammar_requests()
+
+        # Handle the cases where prefill is not allowed
+        if (
+            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.chunked_req is None:
+            return None
+
+        running_bs = len(self.running_batch.reqs)
+        if running_bs >= self.max_running_requests:
+            self.running_batch.batch_is_full = True
+            return None
+
+        if self.enable_hierarchical_cache:
+            # check for completion of hierarchical cache activities to release memory
+            self.tree_cache.writing_check()
+            self.tree_cache.loading_check()
+
+        # Get priority queue
+        prefix_computed = self.policy.calc_priority(self.waiting_queue)
+
+        # Prefill policy
+        adder = PrefillAdder(
+            self.tree_cache,
+            self.token_to_kv_pool_allocator,
+            self.running_batch,
+            self.new_token_ratio,
+            self.max_prefill_tokens,
+            self.chunked_prefill_size,
+            running_bs if self.is_mixed_chunk else 0,
+        )
+
+        if self.chunked_req is not None:
+            self.chunked_req.init_next_round_input()
+            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+
+        if self.lora_paths:
+            lora_set = set([req.lora_path for req in self.running_batch.reqs])
+
+        # Get requests from the waiting queue to a new prefill batch
+        for req in self.waiting_queue:
+            # Semi-PD
+            if req.rid not in rids:
+                logging.info("continue because not in rids")
+                continue
+
+            if (
+                self.lora_paths
+                and len(
+                    lora_set
+                    | set([req.lora_path for req in adder.can_run_list])
+                    | set([req.lora_path])
+                )
+                > self.max_loras_per_batch
+            ):
+                logging.info("lora_paths self.running_batch.batch_is_full= True")
+                self.running_batch.batch_is_full = True
+                break
+
+            if running_bs + len(adder.can_run_list) >= self.max_running_requests:
+                logging.info("running_bs + len(adder.can_run_list) >= self.max_running_requests self.running_batch.batch_is_full= True")
+                self.running_batch.batch_is_full = True
+                break
+
+            req.init_next_round_input(
+                None if prefix_computed else self.tree_cache,
+                self.enable_hierarchical_cache,
+            )
+
+            res = adder.add_one_req(
+                req, self.chunked_req, self.enable_hierarchical_cache
+            )
+
+            # logging.info(f"res: {res}")
+
+            if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.NO_TOKEN:
+                    logging.info(f"kv cache no space.")
+                    if self.enable_hierarchical_cache:
+                        # Set batch_is_full after making sure there are requests that can be served
+                        self.running_batch.batch_is_full = len(
+                            adder.can_run_list
+                        ) > 0 or (
+                            self.running_batch is not None
+                            and not self.running_batch.is_empty()
+                        )
+                    else:
+                        self.running_batch.batch_is_full = True
+                break
+
+        # Update waiting queue
+        can_run_list: List[Req] = adder.can_run_list
+        if len(can_run_list) == 0:
+            return None
+        self.waiting_queue = [
+            x for x in self.waiting_queue if x not in set(can_run_list)
+        ]
+
+        if self.enable_hierarchical_cache:
+            self.tree_cache.read_to_load_cache()
+
+        if adder.new_chunked_req is not None:
+            assert self.chunked_req is None
+            self.chunked_req = adder.new_chunked_req
+
+        if self.chunked_req:
+            self.chunked_req.is_chunked += 1
+
+        # Print stats
+        if self.attn_tp_rank == 0:
+            self.log_prefill_stats(adder, can_run_list, running_bs)
+
+        # Create a new batch
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+            self.server_args.enable_custom_logit_processor,
+        )
+        new_batch.prepare_for_extend()
+        # Semi-PD
+        self.scheduled_prefill_batches.append(new_batch)
+
+        # Mixed-style chunked prefill
+        if (
+            self.is_mixed_chunk
+            and not self.running_batch.is_empty()
+            and not (new_batch.return_logprob or self.running_batch.return_logprob)
+        ):
+            # Semi-PD
+            raise NotImplementedError(
+                "Mixed chunked prefill is not supported in Semi-PD mode"
+            )
+        else:
+            new_batch.decoding_reqs = None
+
+        return new_batch
+
+    def get_next_prefill_batch(self, recv_req: GetNextPrefillBatchInput):
+        if self.chunked_req:
+            self.tree_cache.cache_unfinished_req(self.chunked_req)
+            self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+
+        batch = self.get_new_batch_prefill(recv_req.rids)
+
+        if batch is None:
+            self.bridge_socket.send_pyobj(
+                GetNextPrefillBatchOutput(
+                    rids=[],
+                    chunked_rid=None,
+                    req_pool_indices=[],
+                    prefix_lens=[],
+                    extend_input_lens=[],
+                )
+            )
+            logging.info(f"sending white reqs to prefill scheduler")
+        else:
+            # Serialize the essential information of the batch
+            self.bridge_socket.send_pyobj(
+                GetNextPrefillBatchOutput(
+                    rids=[r.rid for r in batch.reqs],
+                    chunked_rid=(self.chunked_req.rid if self.chunked_req else None),
+                    req_pool_indices=[r.req_pool_idx for r in batch.reqs],
+                    prefix_lens=[len(r.prefix_indices) for r in batch.reqs],
+                    extend_input_lens=[r.extend_input_len for r in batch.reqs],
+                )
+            )
+            rids = [r.rid for r in batch.reqs]
+            logging.info(f"sending reqs: {rids} to prefill scheduler")
+
+    def process_prefill_result(self, recv_req: BatchProcessPrefillResultReq):
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+        batch = self.scheduled_prefill_batches.pop(0)
+        assert len(batch.reqs) == len(recv_req.next_token_ids)
+
+        logits_processor_output = None
+        if recv_req.next_token_logits is not None:
+            logits_processor_output = LogitsProcessorOutput(
+                next_token_logits=torch.from_numpy(recv_req.next_token_logits).to(
+                    self.device, dtype=torch.float16, non_blocking=True
+                ),
+                hidden_states=None,
+            )
+
+        # TODO: return logprobs is not supported in Semi-PD mode
+        result = GenerationBatchResult(
+            next_token_ids=recv_req.next_token_ids,
+            logits_output=logits_processor_output,
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+            bid=-1,  # doesn't matter
+        )
+
+        if self.attn_tp_size > 1:
+            dist.barrier(group=self.attn_tp_cpu_group)
+
+        batch.output_ids = torch.from_numpy(
+            np.array(result.next_token_ids, dtype=np.int64)
+        ).to(self.device, dtype=torch.int64, non_blocking=True)
+        self.process_batch_result_prefill(batch, result)
+
+        batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
+
+        if not batch.is_empty():
+            if self.running_batch.is_empty():
+                self.running_batch = batch
+            else:
+                self.running_batch.merge_batch(batch)
+
+
+
+# REFACTOR: Encapsulate all shared state into a dedicated class.
+# This is a much cleaner pattern than using multiple 'nonlocal' variables.
+@dataclass
+class SchedulerSharedState:
+    """Holds state and synchronization objects shared between scheduler threads."""
+    # Data shared from decode to prefill
+    max_total_num_tokens: Optional[int] = None
+    decode_model_runner: Optional[Any] = None
+    
+    # Synchronization
+    decode_ready_event: td.Event = field(default_factory=td.Event)
+
+
+def _share_model_and_buffers(source_runner, target_runner):
+    """Share model weights and KV cache buffers from a source ModelRunner to a target ModelRunner."""
+    target_runner.model = source_runner.model
+    
+    if isinstance(source_runner.token_to_kv_pool, MHATokenToKVPool):
+        assert isinstance(target_runner.token_to_kv_pool, MHATokenToKVPool)
+        target_runner.token_to_kv_pool.k_buffer = source_runner.token_to_kv_pool.k_buffer
+        target_runner.token_to_kv_pool.v_buffer = source_runner.token_to_kv_pool.v_buffer
+    elif isinstance(source_runner.token_to_kv_pool, MLATokenToKVPool):
+        assert isinstance(target_runner.token_to_kv_pool, MLATokenToKVPool)
+        target_runner.token_to_kv_pool.kv_buffer = source_runner.token_to_kv_pool.kv_buffer
+    
+    target_runner.req_to_token_pool.req_to_token = source_runner.req_to_token_pool.req_to_token
+
+
+# REFACTOR: Pull thread logic into standalone functions for clarity and testability.
+def run_decode_scheduler_thread(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    gpu_id: int,
+    tp_rank: int,
+    dp_rank: Optional[int],
+    dstream: ExternalStream,
+    shared_state: SchedulerSharedState,
+):
+    """Initializes and runs the event loop for the decode scheduler."""
+    
+    dscheduler = SemiPDDecodeScheduler(
+        server_args, port_args, gpu_id, tp_rank, dp_rank, bypass_load_weight=False
+    )
+    logging.info("Decode scheduler init finished.")
+    
+    # Populate the shared state object
+    if dscheduler.enable_overlap:
+        shared_state.decode_model_runner = dscheduler.tp_worker.worker.model_runner
+    else:
+        shared_state.decode_model_runner = dscheduler.tp_worker.model_runner
+    shared_state.max_total_num_tokens = dscheduler.max_total_num_tokens
+
+    dscheduler.init_attention_backend()
+    dscheduler.init_cuda_graphs(dstream)
+
+    dscheduler.tp_worker.worker.init_forward_stream(dstream)
+    
+    # Signal that decode initialization is complete and data is ready for prefill thread
+    shared_state.decode_ready_event.set()
+    
+    logging.info("Decode scheduler initialized. Starting event loop...")
+    if dscheduler.enable_overlap:
+        dscheduler.event_loop_overlap()
+    else:
+        dscheduler.event_loop_normal()
+    
+
+def run_prefill_scheduler_thread(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    gpu_id: int,
+    tp_rank: int,
+    dp_rank: Optional[int],
+    pstream: ExternalStream,
+    shared_state: SchedulerSharedState,
+    pipe_writer,
+):
+    """Initializes and runs the event loop for the prefill scheduler."""
+    # Wait for the decode scheduler to be ready
+    shared_state.decode_ready_event.wait()
+    
+    # Use the data prepared by the decode thread
+    server_args.max_total_tokens = shared_state.max_total_num_tokens
+    logging.info(f"Prefill scheduler using max_total_tokens: {shared_state.max_total_num_tokens}")
+    
+    pscheduler = SemiPDPrefillScheduler(
+        server_args, port_args, gpu_id, tp_rank, dp_rank, bypass_load_weight=True
+    )
+    logging.info("Prefill scheduler init finished.")
+
+    if pscheduler.enable_overlap:
+        target_runner = pscheduler.tp_worker.worker.model_runner
+    else:
+        target_runner = pscheduler.tp_worker.model_runner
+
+    # Share model and buffers from the decode scheduler
+    _share_model_and_buffers(
+        source_runner=shared_state.decode_model_runner,
+        target_runner=target_runner,
+    )
+
+    pscheduler.init_attention_backend()
+
+    pscheduler.tp_worker.init_forward_stream(pstream)
+        
+    pipe_writer.send({
+            "status": "ready",
+            "max_total_num_tokens": shared_state.max_total_num_tokens,
+            "max_req_input_len": pscheduler.max_req_input_len,
+        })
+    
+    logging.info("Prefill scheduler initialized. Starting event loop...")
+    pscheduler.event_loop_normal()
+
+def run_scheduler_process(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    gpu_id: int,
+    tp_rank: int,
+    dp_rank: Optional[int],
+    pipe_writer,
+    sm_prefill: float,
+    sm_decode: float,
+):
+    # --- Process Configuration ---
+    if dp_rank is None:
+        prefix = f"TP {tp_rank}"
+    else:
+        prefix = f"DP{dp_rank} TP{tp_rank}"
+    if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
+        dp_rank = int(os.environ["SGLANG_DP_RANK"])
+
+    setproctitle.setproctitle(f"sglang::semi_pd_scheduler{prefix.replace(' ', '_')}")
+    faulthandler.enable()
+    parent_process = psutil.Process().parent()
+    configure_logger(server_args, prefix=prefix)
+    suppress_other_loggers()
+
+    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
+        set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
+
+    # --- Stream and State Initialization ---
+    pstream, dstream = create_greenctx_stream_by_percent_py(sm_prefill, sm_decode, tp_rank)
+    
+    shared_state = SchedulerSharedState()
+
+    try:
+        # --- Thread Creation and Startup ---
+        d_thread = td.Thread(
+            target=run_decode_scheduler_thread,
+            name="decode_scheduler",
+            args=(server_args, port_args, gpu_id, tp_rank, dp_rank, dstream, shared_state),
+        )
+        p_thread = td.Thread(
+            target=run_prefill_scheduler_thread,
+            name="prefill_scheduler",
+            args=(server_args, port_args, gpu_id, tp_rank, dp_rank, pstream, shared_state, pipe_writer),
+        )
+        
+        d_thread.start()
+        p_thread.start()
+        
+        # --- Monitor and Join ---
+        d_thread.join()
+        p_thread.join()
+        
+        logger.info("Scheduler threads have completed. Exiting process.")
+
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"Scheduler process hit an exception: {traceback}")
+        if parent_process.is_running():
+            parent_process.send_signal(signal.SIGQUIT)
+
+class SemiPDStandaloneScheduler:
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        port_args: SemiPDPortArgs,
+        gpu_id: int,
+        tp_rank: int,
+        dp_rank: Optional[int],
+    ):
+        nccl_port = port_args.s_nccl_port
+        self.tp_worker = TpModelWorker(
+            server_args=server_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            dp_rank=dp_rank,
+            nccl_port=nccl_port,
+            bypass_load_weight=False,
+            instance_role=InstanceRole.OTHER,
+        )
+
+        self.max_total_num_tokens = self.tp_worker.max_total_num_tokens
+
+    def get_ipc_info(self):
+        return self.tp_worker.get_ipc_info()
+
+    def event_loop(self):
+        while True:
+            time.sleep(1)
+
+class MemoryCachingContext:
+    """
+    Disable tensor reuse cache.
+
+    This is used for avoiding memory caching in model loading, some of the model parameters
+    which get relative small size, will reuse memory from cache pool. This will cause the IPC
+    memory panic, so we disable the memory caching for real model loading.
+    """
+
+    def __init__(self, enable_caching: bool = True):
+        self.enable_caching = enable_caching
+
+    def __enter__(self):
+        if not self.enable_caching:
+            os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if not self.enable_caching:
+            del os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"]
+
+def run_standalone_scheduler_process(
+    server_args: ServerArgs,
+    port_args: SemiPDPortArgs,
+    gpu_id: int,
+    tp_rank: int,
+    dp_rank: Optional[int],
+    pipe_writer,
+    bypass_load_weight: bool = False,
+    p_ipc_info_queue: mp.Queue = None,
+    d_ipc_info_queue: mp.Queue = None,
+):
+    setproctitle.setproctitle("sglang::semi_pd_standalone_scheduler")
+    faulthandler.enable()
+
+    # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
+    if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
+        dp_rank = int(os.environ["SGLANG_DP_RANK"])
+
+    role = "Standalone"
+    # Configure the logger
+    if dp_rank is None:
+        configure_logger(server_args, prefix=f" {role} TP{tp_rank}")
+    else:
+        configure_logger(server_args, prefix=f" {role} DP{dp_rank} TP{tp_rank}")
+    suppress_other_loggers()
+
+    # Set cpu affinity to this gpu process
+    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
+        set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
+
+    # Create a scheduler and run the event loop
+    try:
+        with MemoryCachingContext(enable_caching=False):
+            scheduler = SemiPDStandaloneScheduler(
+                server_args,
+                port_args,
+                gpu_id,
+                tp_rank,
+                dp_rank,
+            )
+        ipc_info = scheduler.get_ipc_info()
+        p_ipc_info_queue.put(ipc_info)
+        d_ipc_info_queue.put(ipc_info)
+
+        pipe_writer.send(
+            {
+                "status": "ready",
+                "max_total_num_tokens": scheduler.max_total_num_tokens,
+            }
+        )
+
+        scheduler.event_loop()
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"Scheduler hit an exception: {traceback}")

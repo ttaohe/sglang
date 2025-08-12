@@ -58,10 +58,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.scheduler import run_scheduler_process as run_scheduler_process_normal
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, SemiPDPortArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -117,7 +117,26 @@ class Engine(EngineBase):
         atexit.register(self.shutdown)
 
         # Allocate ports for inter-process communications
-        self.port_args = PortArgs.init_new(server_args)
+        if getattr(server_args, "engine_mode", "normal") == "semipd":
+            from sglang.srt.server_args import SemiPDPortArgs
+            import tempfile
+            assert (
+                server_args.dp_size == 1
+            ), "semipd engine_mode currently only supports dp_size == 1"
+            self.port_args = SemiPDPortArgs.init_new(server_args)
+            # Inject aliases for compatibility with TokenizerManager   # unnormal 
+            if not hasattr(self.port_args, "scheduler_input_ipc_name"):
+                self.port_args.scheduler_input_ipc_name = (
+                    self.port_args.s_scheduler_input_ipc_name
+                )
+            if not hasattr(self.port_args, "nccl_port"):
+                self.port_args.nccl_port = self.port_args.s_nccl_port
+            if not hasattr(self.port_args, "rpc_ipc_name"):
+                self.port_args.rpc_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+            if not hasattr(self.port_args, "metrics_ipc_name"):
+                self.port_args.metrics_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        else:
+            self.port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
         # Launch subprocesses
@@ -130,10 +149,12 @@ class Engine(EngineBase):
         self.template_manager = template_manager
         self.scheduler_info = scheduler_info
 
-        context = zmq.Context(2)
-        self.send_to_rpc = get_zmq_socket(
-            context, zmq.DEALER, self.port_args.rpc_ipc_name, True
-        )
+        # Only normal mode has rpc_ipc_name for now
+        if hasattr(self.port_args, "rpc_ipc_name"):
+            context = zmq.Context(2)
+            self.send_to_rpc = get_zmq_socket(
+                context, zmq.DEALER, self.port_args.rpc_ipc_name, True
+            )
 
     def generate(
         self,
@@ -681,7 +702,10 @@ def _launch_subprocesses(
     server_args: ServerArgs, port_args: Optional[PortArgs] = None
 ) -> Tuple[TokenizerManager, TemplateManager, Dict]:
     """
-    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
+    Launch TokenizerManager in main proc; launch Scheduler(s) and DetokenizerManager as subprocesses.
+    It supports two engine modes:
+    - normal: legacy single scheduler per TP/PP rank
+    - semipd: semi-disaggregation (prefill/decode sharing one process; dp_size must be 1 for now)
     """
     # Configure global environment
     configure_logger(server_args)
@@ -690,7 +714,26 @@ def _launch_subprocesses(
 
     # Allocate ports for inter-process communications
     if port_args is None:
-        port_args = PortArgs.init_new(server_args)
+        if getattr(server_args, "engine_mode", "normal") == "semipd":
+            # SemiPD uses its own PortArgs with extra fields
+            from sglang.srt.server_args import SemiPDPortArgs
+            import tempfile
+
+            assert (
+                server_args.dp_size == 1
+            ), "semipd engine_mode currently only supports dp_size == 1"
+            port_args = SemiPDPortArgs.init_new(server_args)
+            # Inject aliases for components that expect PortArgs fields
+            if not hasattr(port_args, "scheduler_input_ipc_name"):
+                port_args.scheduler_input_ipc_name = port_args.s_scheduler_input_ipc_name
+            if not hasattr(port_args, "nccl_port"):
+                port_args.nccl_port = port_args.s_nccl_port
+            if not hasattr(port_args, "rpc_ipc_name"):
+                port_args.rpc_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+            if not hasattr(port_args, "metrics_ipc_name"):
+                port_args.metrics_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        else:
+            port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
     # If using model from www.modelscope.cn, first download the model.
@@ -726,21 +769,46 @@ def _launch_subprocesses(
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
-                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
-                proc = mp.Process(
-                    target=run_scheduler_process,
-                    args=(
-                        server_args,
-                        port_args,
-                        gpu_id,
-                        tp_rank,
-                        moe_ep_rank,
-                        pp_rank,
-                        None,
-                        writer,
-                        None,
-                    ),
-                )
+                if getattr(server_args, "engine_mode", "normal") == "semipd":
+                    # SemiPD scheduler signature: (server_args, port_args, gpu_id, tp_rank, dp_rank, pipe_writer, sm_prefill, sm_decode)
+                    from sglang.srt.semidisaggregation.semipd.scheduler import (
+                        run_scheduler_process as run_scheduler_process_semipd,
+                    )
+                    from sglang.srt.semidisaggregation.semipd.utils import (
+                        SM_PREFILL_RATIO,
+                        SM_DECODE_RATIO,
+                    )
+
+                    proc = mp.Process(
+                        target=run_scheduler_process_semipd,
+                        args=(
+                            server_args,
+                            port_args,
+                            gpu_id,
+                            tp_rank,
+                            None,
+                            writer,
+                            SM_PREFILL_RATIO,
+                            SM_DECODE_RATIO,
+                        ),
+                    )
+                else:
+                    # Normal scheduler signature
+                    moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+                    proc = mp.Process(
+                        target=run_scheduler_process_normal,
+                        args=(
+                            server_args,
+                            port_args,
+                            gpu_id,
+                            tp_rank,
+                            moe_ep_rank,
+                            pp_rank,
+                            None,
+                            writer,
+                            None,
+                        ),
+                    )
 
                 with memory_saver_adapter.configure_subprocess():
                     proc.start()
@@ -823,5 +891,11 @@ def _launch_subprocesses(
 
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
-    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    if "max_req_input_len" in scheduler_info:
+        tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     return tokenizer_manager, template_manager, scheduler_info
+
+
+def _launch_semipd_gtx_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dict]:
+    # Deprecated: unified into _launch_subprocesses via engine_mode switch.
+    raise NotImplementedError("Use engine_mode=semipd with _launch_subprocesses instead.")
