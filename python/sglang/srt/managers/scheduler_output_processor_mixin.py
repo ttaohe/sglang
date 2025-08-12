@@ -50,13 +50,15 @@ class SchedulerOutputProcessorMixin:
                 result.extend_logprob_start_len_per_req,
             )
 
-            if self.enable_overlap:
-                logits_output, next_token_ids, _ = (
-                    self.tp_worker.resolve_last_batch_result(launch_done)
-                )
+            # Semi-PD
+            if self.enable_overlap and self.server_args.engine_mode == "normal":
+                logits_output, next_token_ids, _ = self.tp_worker.resolve_batch_result(launch_done)
             else:
                 # Move next_token_ids and logprobs to cpu
-                next_token_ids = next_token_ids.tolist()
+                # Semi-PD
+                if not isinstance(next_token_ids, list):
+                    next_token_ids = next_token_ids.tolist()
+
                 if batch.return_logprob:
                     if logits_output.next_token_logprobs is not None:
                         logits_output.next_token_logprobs = (

@@ -51,6 +51,8 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
+from sglang.srt.semidisaggregation.semipd.utils import AggregatedSocket
+
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import (
@@ -120,7 +122,7 @@ from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, SemiPDPortArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
     get_bool_env_var,
@@ -259,9 +261,26 @@ class TokenizerManager:
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
-        self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
-        )
+
+        if server_args.engine_mode=="semipd" and server_args.dp_size == 1:
+            assert isinstance(port_args, SemiPDPortArgs)
+            self.send_to_p_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.p_scheduler_input_ipc_name, False
+            )
+            self.send_to_d_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.d_scheduler_input_ipc_name, False
+            )
+            # Decode first, for better performance.
+            self.send_to_scheduler = AggregatedSocket(
+                [self.send_to_d_scheduler, self.send_to_p_scheduler]
+            )
+            
+            logging.info("set semipd mode tokenizer send 2 p and d")
+        else:
+            assert isinstance(port_args, PortArgs)
+            self.send_to_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+            )
 
         # Request states
         self.no_create_loop = False

@@ -153,7 +153,6 @@ class TpModelWorkerClient:
             model_worker_batch, future_token_ids_ct, sync_event = self.input_queue.get()
             if not model_worker_batch:
                 break
-
             sync_event.wait()
 
             # Keep a reference of model_worker_batch by storing it into a list.
@@ -243,7 +242,6 @@ class TpModelWorkerClient:
         # A cuda stream sync here to avoid the cuda illegal memory access error.
         sync_event = torch.get_device_module(self.device).Event()
         sync_event.record(self.scheduler_stream)
-
         # Push a new batch to the queue
         self.input_queue.put((model_worker_batch, self.future_token_ids_ct, sync_event))
 
