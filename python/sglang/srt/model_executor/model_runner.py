@@ -288,59 +288,64 @@ class ModelRunner:
         self.sampler = Sampler()
         self.load_model()
 
-        # Check if the model is using hybrid SWA
-        if (
-            not self.server_args.disable_hybrid_swa_memory
-            and self.sliding_window_size is not None
-            and self.sliding_window_size > 0
-        ):
-            architectures = self.model_config.hf_config.architectures
-            if architectures and not any("Llama4" in arch for arch in architectures):
-                self.is_hybrid = self.model_config.is_hybrid = True
+        from sglang.srt.semidisaggregation.semipd.parallel_state_semipd import _SEMIPD_TL
+        # 若 semipd，优先绑定线程角色对应的独立通信组，避免依赖全局猴补
+        if (getattr(self.server_args, "engine_mode", "normal") == "semipd" and _SEMIPD_TL.role == "decode")  or getattr(self.server_args, "engine_mode", "normal") == "normal" :
 
-        # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
-        # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
-        # determine the number of layers.
-        model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None
-        model_num_layers = (
-            self.model_config.num_nextn_predict_layers
-            if self.is_draft_worker and model_has_mtp_layers
-            else self.model_config.num_hidden_layers
-        )
-        self.start_layer = getattr(self.model, "start_layer", 0)
-        self.end_layer = getattr(self.model, "end_layer", model_num_layers)
-        self.num_effective_layers = self.end_layer - self.start_layer
-        assert (not model_has_mtp_layers) or (
-            self.num_effective_layers == model_num_layers
-        ), "PP is not compatible with MTP models."
+            # Check if the model is using hybrid SWA
+            if (
+                not self.server_args.disable_hybrid_swa_memory
+                and self.sliding_window_size is not None
+                and self.sliding_window_size > 0
+            ):
+                architectures = self.model_config.hf_config.architectures
+                if architectures and not any("Llama4" in arch for arch in architectures):
+                    self.is_hybrid = self.model_config.is_hybrid = True
 
-        # Apply torchao quantization
-        torchao_applied = getattr(self.model, "torchao_applied", False)
-        # In layered loading, torchao may have been applied
-        if not torchao_applied:
-            apply_torchao_config_to_model(
-                self.model, global_server_args_dict["torchao_config"]
+            # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
+            # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
+            # determine the number of layers.
+            model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None
+            model_num_layers = (
+                self.model_config.num_nextn_predict_layers
+                if self.is_draft_worker and model_has_mtp_layers
+                else self.model_config.num_hidden_layers
             )
+            self.start_layer = getattr(self.model, "start_layer", 0)
+            self.end_layer = getattr(self.model, "end_layer", model_num_layers)
+            self.num_effective_layers = self.end_layer - self.start_layer
+            assert (not model_has_mtp_layers) or (
+                self.num_effective_layers == model_num_layers
+            ), "PP is not compatible with MTP models."
 
-        # Apply torch TP if the model supports it
-        supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
-        if self.tp_size > 1 and supports_torch_tp:
-            self.apply_torch_tp()
+            # Apply torchao quantization
+            torchao_applied = getattr(self.model, "torchao_applied", False)
+            # In layered loading, torchao may have been applied
+            if not torchao_applied:
+                apply_torchao_config_to_model(
+                    self.model, global_server_args_dict["torchao_config"]
+                )
 
-        # Init lora
-        if server_args.enable_lora:
-            self.init_lora_manager()
+            # Apply torch TP if the model supports it
+            supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
+            if self.tp_size > 1 and supports_torch_tp:
+                self.apply_torch_tp()
 
-        # Init memory pool and attention backends
-        self.init_memory_pool(
-            min_per_gpu_memory,
-            server_args.max_running_requests,
-            server_args.max_total_tokens,
-        )
+            # Init lora
+            if server_args.enable_lora:
+                self.init_lora_manager()
+
+            # Init memory pool and attention backends
+            self.init_memory_pool(
+                min_per_gpu_memory,
+                server_args.max_running_requests,
+                server_args.max_total_tokens,
+            )
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
-            self.init_cuda_graphs()
+            # if getattr(self.server_args, "engine_mode") == "normal" or _SEMIPD_TL.role == "decode":
+            #     self.init_cuda_graphs()
         else:
             self.cuda_graph_runner = None
             self.cuda_graph_mem_usage = 0
@@ -575,6 +580,17 @@ class ModelRunner:
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
 
         if not self.is_draft_worker:
+            # In semipd, let DECODE线程负责初始化并创建/校验并行组；PREFILL线程跳过该步骤，复用已初始化的组
+            semipd_prefill_thread = False
+            if getattr(self.server_args, "engine_mode", "normal") == "semipd":
+                try:
+                    from sglang.srt.semidisaggregation.semipd import parallel_state_semipd as sps  # type: ignore
+
+                    thread_role = getattr(getattr(sps, "_SEMIPD_TL", object()), "role", None)
+                    semipd_prefill_thread = thread_role == "prefill"
+                except Exception:
+                    semipd_prefill_thread = False
+
             if self.device == "cpu":
                 if _is_cpu_amx_available:
                     # Bind OpenMP threads to CPU cores
@@ -588,29 +604,30 @@ class ModelRunner:
                         "init_cpu_threads_env and shared memory based AllReduce is disabled since intel amx backend is not available"
                     )
 
-            # Only initialize the distributed environment on the target model worker.
-            init_distributed_environment(
-                backend=backend,
-                world_size=self.tp_size * self.pp_size,
-                rank=self.tp_size * self.pp_rank + self.tp_rank,
-                local_rank=self.gpu_id,
-                distributed_init_method=dist_init_method,
-                timeout=self.server_args.dist_timeout,
-            )
-            initialize_model_parallel(
-                tensor_model_parallel_size=self.tp_size,
-                pipeline_model_parallel_size=self.pp_size,
-                expert_model_parallel_size=self.moe_ep_size,
-                duplicate_tp_group=self.server_args.enable_pdmux,
-            )
-            initialize_dp_attention(
-                enable_dp_attention=self.server_args.enable_dp_attention,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-                dp_size=self.server_args.dp_size,
-                moe_dense_tp_size=self.server_args.moe_dense_tp_size,
-                pp_size=self.server_args.pp_size,
-            )
+            # Only initialize the distributed environment on the target model worker (decode thread in semipd)
+            if not semipd_prefill_thread:
+                init_distributed_environment(
+                    backend=backend,
+                    world_size=self.tp_size * self.pp_size,
+                    rank=self.tp_size * self.pp_rank + self.tp_rank,
+                    local_rank=self.gpu_id,
+                    distributed_init_method=dist_init_method,
+                    timeout=self.server_args.dist_timeout,
+                )
+                initialize_model_parallel(
+                    tensor_model_parallel_size=self.tp_size,
+                    pipeline_model_parallel_size=self.pp_size,
+                    expert_model_parallel_size=self.moe_ep_size,
+                    duplicate_tp_group=self.server_args.enable_pdmux,
+                )
+                initialize_dp_attention(
+                    enable_dp_attention=self.server_args.enable_dp_attention,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    dp_size=self.server_args.dp_size,
+                    moe_dense_tp_size=self.server_args.moe_dense_tp_size,
+                    pp_size=self.server_args.pp_size,
+                )
 
         min_per_gpu_memory = get_available_gpu_memory(
             self.device,
@@ -618,8 +635,34 @@ class ModelRunner:
             distributed=get_world_group().world_size > 1,
             cpu_group=get_world_group().cpu_group,
         )
-        self.tp_group = get_tp_group()
-        self.attention_tp_group = get_attention_tp_group()
+        # 若 semipd，优先绑定线程角色对应的独立通信组，避免依赖全局猴补
+        if getattr(self.server_args, "engine_mode", "normal") == "semipd":
+            try:
+                from sglang.srt.semidisaggregation.semipd.group_provider import (
+                    get_tp_group_role_aware,
+                )
+                self.tp_group = get_tp_group_role_aware()
+            except Exception as e:
+                raise RuntimeError(f"semipd tp group initialization failed: {e}")
+        else:
+            self.tp_group = get_tp_group()
+            logging.info("get_tp_group from normal")
+        try:
+            logger.info(
+                f"selected TP group: name={self.tp_group.semipd_groupname}, world_size={self.tp_group.world_size}, rank_in_group={self.tp_group.rank_in_group}"
+            )
+        except Exception:
+            pass
+        if getattr(self.server_args, "engine_mode", "normal") == "semipd":
+            try:
+                from sglang.srt.semidisaggregation.semipd.group_provider import (
+                    get_attention_tp_group_role_aware,
+                )
+                self.attention_tp_group = get_attention_tp_group_role_aware(self.server_args)
+            except Exception:
+                self.attention_tp_group = get_attention_tp_group()
+        else:
+            self.attention_tp_group = get_attention_tp_group()
 
         # Check memory for tensor parallelism
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -642,6 +685,7 @@ class ModelRunner:
         return min_per_gpu_memory
 
     def load_model(self):
+        # 在 semipd 模式下，prefill 线程会进入本函数，但可选择跳过实际权重加载，仅完成必要配置
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -674,6 +718,36 @@ class ModelRunner:
             )
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
+
+        # 若被要求跳过实际权重加载（prefill 线程），则做轻量初始化后直接从 decode 继承共享模型
+        if getattr(self.server_args, "skip_model_weight_loading", False):
+            try:
+                from sglang.srt.semidisaggregation.semipd.runner import adopt_from_registered_decode_if_needed
+                adopt_from_registered_decode_if_needed(self)
+                logger.info("Skip weight loading; adopted decode runner successfully.")
+            except Exception:
+                logger.warning("Skip weight loading; adopt decode runner failed.")
+            # 兜底设置必要属性，避免访问 self.model 失败
+            self.dtype = getattr(self, "dtype", self.model_config.dtype)
+            self.sliding_window_size = getattr(
+                self,
+                "sliding_window_size",
+                self.model_config.attention_chunk_size
+                if self.model_config.attention_chunk_size is not None
+                else None,
+            )
+            self.weight_load_mem_usage = getattr(self, "weight_load_mem_usage", 0.0)
+            try:
+                dist.monitored_barrier(
+                    group=get_tp_group().cpu_group,
+                    timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
+                    wait_all_ranks=True,
+                )
+            except RuntimeError:
+                raise ValueError(
+                    f"TP rank {self.tp_rank} finished the (skipped) model loading path, but other ranks didn't."
+                ) from None
+            return
 
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
@@ -813,6 +887,21 @@ class ModelRunner:
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
+
+    # ---
+    # SemiPD: invoked after adopting a shared model from decode runner
+    def sync_after_adopt_shared_model(self) -> None:
+        try:
+            # dtype follows config; model may not expose dtype attribute consistently
+            self.dtype = self.model_config.dtype
+            # recompute sliding window from actual model if available
+            if hasattr(self.model, "get_attention_sliding_window_size"):
+                self.sliding_window_size = self.model.get_attention_sliding_window_size()
+            elif self.model_config.attention_chunk_size is not None:
+                self.sliding_window_size = self.model_config.attention_chunk_size
+            # keep other derived fields intact
+        except Exception:
+            pass
 
     def init_weights_update_group(
         self,
@@ -1584,8 +1673,12 @@ class ModelRunner:
                 .cuda()
             )
 
-    def init_cuda_graphs(self):
-        """Capture cuda graphs."""
+    def init_cuda_graphs(self, stream: Optional[torch.cuda.Stream] = None):
+        """Capture cuda graphs.
+
+        If `stream` is provided, capture will be performed on that CUDA stream.
+        Otherwise, a fresh stream will be created by the graph_capture context.
+        """
         self.cuda_graph_runner = None
         self.cuda_graph_mem_usage = 0
 
@@ -1601,7 +1694,13 @@ class ModelRunner:
         logger.info(
             f"Capture cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        self.cuda_graph_runner = CudaGraphRunner(self)
+        # If a stream is provided, pass a GraphCaptureContext so capture happens on that stream
+        if stream is not None:
+            from sglang.srt.distributed.parallel_state import GraphCaptureContext
+            context = GraphCaptureContext(stream)
+            self.cuda_graph_runner = CudaGraphRunner(self, context)
+        else:
+            self.cuda_graph_runner = CudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.cuda_graph_mem_usage = before_mem - after_mem
         logger.info(

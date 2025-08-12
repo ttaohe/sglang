@@ -117,7 +117,6 @@ def initialize_dp_attention(
     else:
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
-
     tp_group = get_tp_group()
     _ATTN_TP_GROUP = GroupCoordinator(
         [

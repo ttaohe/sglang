@@ -278,6 +278,9 @@ class ServerArgs:
     enable_pdmux: bool = False
     sm_group_num: int = 3
 
+    # Engine mode: normal = legacy single-scheduler; semipd = semi-disaggregation (prefill/decode in one proc)
+    engine_mode: str = "normal"
+
     # Deprecated arguments
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
@@ -1923,6 +1926,14 @@ class ServerArgs:
             help="Enable PD-Multiplexing, PD running on greenctx stream.",
         )
 
+        parser.add_argument(
+            "--engine-mode",
+            type=str,
+            default=ServerArgs.engine_mode,
+            choices=["normal", "semipd"],
+            help="Engine launch mode. 'normal': standard scheduler; 'semipd': semi-disaggregation scheduler (dp_size must be 1).",
+        )
+
         # For PD-Multiplexing
         parser.add_argument(
             "--sm-group-num",
@@ -2204,6 +2215,98 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 
 ZMQ_TCP_PORT_DELTA = 233
+
+@dataclasses.dataclass
+class SemiPDPortArgs:
+    tokenizer_ipc_name: str
+    # For standalone scheduler
+    s_scheduler_input_ipc_name: str
+    # For prefill scheduler
+    p_scheduler_input_ipc_name: str
+    # For decode scheduler
+    d_scheduler_input_ipc_name: str
+    detokenizer_ipc_name: str
+
+    bridge_ipc_name: str
+
+    # The ipc filename for rpc call between Engine and Scheduler
+    rpc_ipc_name: str
+    # The ipc filename for Scheduler to send metrics
+    metrics_ipc_name: str
+
+    s_nccl_port: int
+    p_nccl_port: int
+    d_nccl_port: int
+
+    def get_nccl_port(server_args: ServerArgs) -> int:
+        port = server_args.port + random.randint(100, 1000)
+        while True:
+            if is_port_available(port):
+                break
+            if port < 60000:
+                port += 42
+            else:
+                port -= 43
+        return port
+
+    @staticmethod
+    def init_new(server_args, dp_rank: Optional[int] = None) -> "SemiPDPortArgs":
+        s_port = SemiPDPortArgs.get_nccl_port(server_args)
+        p_port = SemiPDPortArgs.get_nccl_port(server_args)
+        d_port = SemiPDPortArgs.get_nccl_port(server_args)
+
+        if not server_args.enable_dp_attention:
+            return SemiPDPortArgs(
+                tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                s_scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                p_scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                d_scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                bridge_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                s_nccl_port=s_port,
+                p_nccl_port=p_port,
+                d_nccl_port=d_port,
+            )
+        else:
+            if server_args.nnodes > 1:
+                raise NotImplementedError("Multi-node SemiPD is not supported yet")
+
+            if server_args.dist_init_addr is None:
+                dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+            else:
+                dist_init_addr = server_args.dist_init_addr.split(":")
+            assert (
+                len(dist_init_addr) == 2
+            ), "please provide --dist-init-addr as host:port of head node"
+
+            dist_init_host, dist_init_port = dist_init_addr
+            port_base = int(dist_init_port) + 1
+            detokenizer_port = port_base + 1
+            rpc_port = port_base + 2
+            metrics_ipc_name = port_base + 3
+            if dp_rank is None:
+                scheduler_input_port = (
+                    port_base + 2
+                )  # TokenizerManager to DataParallelController
+            else:
+                scheduler_input_port = port_base + 2 + 1 + dp_rank
+                scheduler_input_port = port_base + 2 + 1 + (dp_rank + 1) * 4
+
+            return SemiPDPortArgs(
+                tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
+                s_scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
+                p_scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port + 1}",
+                d_scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port + 2}",
+                detokenizer_ipc_name=f"tcp://{dist_init_host}:{detokenizer_port}",
+                rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
+                metrcs_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
+                bridge_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port + 3}",
+                s_nccl_port=s_port,
+                p_nccl_port=p_port,
+                d_nccl_port=d_port,
+            )
 
 
 @dataclasses.dataclass

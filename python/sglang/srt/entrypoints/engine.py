@@ -58,10 +58,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.scheduler import run_scheduler_process as run_scheduler_process_normal
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, SemiPDPortArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -117,7 +117,14 @@ class Engine(EngineBase):
         atexit.register(self.shutdown)
 
         # Allocate ports for inter-process communications
-        self.port_args = PortArgs.init_new(server_args)
+        if getattr(server_args, "engine_mode", "normal") == "semipd":
+            from sglang.srt.server_args import SemiPDPortArgs
+            assert (
+                server_args.dp_size == 1
+            ), "semipd engine_mode currently only supports dp_size == 1"
+            self.port_args = SemiPDPortArgs.init_new(server_args)
+        else:
+            self.port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
         # Launch subprocesses
@@ -681,7 +688,10 @@ def _launch_subprocesses(
     server_args: ServerArgs, port_args: Optional[PortArgs] = None
 ) -> Tuple[TokenizerManager, TemplateManager, Dict]:
     """
-    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
+    Launch TokenizerManager in main proc; launch Scheduler(s) and DetokenizerManager as subprocesses.
+    It supports two engine modes:
+    - normal: legacy single scheduler per TP/PP rank
+    - semipd: semi-disaggregation (prefill/decode sharing one process; dp_size must be 1 for now)
     """
     # Configure global environment
     configure_logger(server_args)
@@ -690,7 +700,18 @@ def _launch_subprocesses(
 
     # Allocate ports for inter-process communications
     if port_args is None:
-        port_args = PortArgs.init_new(server_args)
+        if getattr(server_args, "engine_mode", "normal") == "semipd":
+            # SemiPD uses its own PortArgs with extra fields
+            from sglang.srt.server_args import SemiPDPortArgs
+            import tempfile
+
+            assert (
+                server_args.dp_size == 1
+            ), "semipd engine_mode currently only supports dp_size == 1"
+            port_args = SemiPDPortArgs.init_new(server_args)
+            
+        else:
+            port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
     # If using model from www.modelscope.cn, first download the model.
@@ -727,20 +748,47 @@ def _launch_subprocesses(
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
-                proc = mp.Process(
-                    target=run_scheduler_process,
-                    args=(
-                        server_args,
-                        port_args,
-                        gpu_id,
-                        tp_rank,
-                        moe_ep_rank,
-                        pp_rank,
-                        None,
-                        writer,
-                        None,
-                    ),
-                )
+                if getattr(server_args, "engine_mode", "normal") == "semipd":
+                    # SemiPD scheduler
+                    from sglang.srt.semidisaggregation.semipd.scheduler import (
+                        run_scheduler_process as run_scheduler_process_semipd,
+                    )
+                    from sglang.srt.semidisaggregation.semipd.utils import (
+                        SM_PREFILL_RATIO,
+                        SM_DECODE_RATIO,
+                    )
+
+                    proc = mp.Process(
+                        target=run_scheduler_process_semipd,
+                        args=(
+                            server_args,
+                            port_args,
+                            gpu_id,
+                            tp_rank,
+                            moe_ep_rank,
+                            pp_rank,
+                            None,
+                            writer,
+                            SM_PREFILL_RATIO,
+                            SM_DECODE_RATIO,
+                        ),
+                    )
+                else:
+                    # Normal scheduler
+                    proc = mp.Process(
+                        target=run_scheduler_process_normal,
+                        args=(
+                            server_args,
+                            port_args,
+                            gpu_id,
+                            tp_rank,
+                            moe_ep_rank,
+                            pp_rank,
+                            None,
+                            writer,
+                            None,
+                        ),
+                    )
 
                 with memory_saver_adapter.configure_subprocess():
                     proc.start()
@@ -824,4 +872,5 @@ def _launch_subprocesses(
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    
     return tokenizer_manager, template_manager, scheduler_info

@@ -32,7 +32,11 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
-from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    GraphCaptureContext,
+    graph_capture,
+)
 from sglang.srt.layers.dp_attention import DPPaddingMode, get_attention_tp_size
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
@@ -232,7 +236,7 @@ def set_global_graph_memory_pool(val):
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(self, model_runner: ModelRunner, context: Optional[GraphCaptureContext] = None):
         # Parse args
         self.model_runner = model_runner
         self.graphs = {}
@@ -384,7 +388,7 @@ class CudaGraphRunner:
         # Capture
         try:
             with model_capture_mode():
-                self.capture()
+                self.capture(context)
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
@@ -442,7 +446,7 @@ class CudaGraphRunner:
             and capture_hidden_mode_matches
         )
 
-    def capture(self) -> None:
+    def capture(self, context: Optional[GraphCaptureContext] = None) -> None:
         profile_context = empty_context()
         if self.enable_profile_cuda_graph:
             profile_context = profile(
@@ -455,7 +459,7 @@ class CudaGraphRunner:
         # can reuse the memory pool allocated for the large shapes.
         with freeze_gc(
             self.model_runner.server_args.enable_cudagraph_gc
-        ), graph_capture() as graph_capture_context:
+        ), graph_capture(context) as graph_capture_context:
             with profile_context as prof:
                 self.stream = graph_capture_context.stream
                 avail_mem = get_available_gpu_memory(

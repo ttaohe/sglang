@@ -155,6 +155,58 @@ class TpModelWorker:
             src=self.world_group.ranks[0],
         )[0]
         set_random_seed(self.random_seed)
+        # try:
+        #     # In semipd prefill thread, avoid duplicating a world-group broadcast.
+        #     semipd_role = None
+        #     try:
+        #         from sglang.srt.semidisaggregation.semipd.parallel_state_semipd import (
+        #             _SEMIPD_TL as _semipd_tl,
+        #         )
+        #         semipd_role = getattr(_semipd_tl, "role", None)
+        #     except Exception:
+        #         semipd_role = None
+
+        #     if getattr(server_args, "engine_mode", "normal") == "semipd" and semipd_role == "prefill":
+        #         self.random_seed = server_args.random_seed
+        #         logger.info(
+        #             "Seed broadcast skipped in semipd prefill. Using server_args.random_seed=%s",
+        #             self.random_seed,
+        #         )
+        #         set_random_seed(self.random_seed)
+        #     else:
+        #         src_ranks = getattr(self.world_group, "ranks", None)
+        #         src_rank = None
+        #         if isinstance(src_ranks, (list, tuple)) and len(src_ranks) > 0:
+        #             src_rank = src_ranks[0]
+        #         logger.info(
+        #             "Seed broadcast debug: tp_size=%s tp_rank=%s pp_rank=%s world_size=%s src_ranks=%s src_rank=%s",
+        #             self.tp_size,
+        #             self.tp_rank,
+        #             self.pp_rank,
+        #             getattr(self.world_group, "world_size", None),
+        #             src_ranks,
+        #             src_rank,
+        #         )
+        #         self.random_seed = broadcast_pyobj(
+        #             [server_args.random_seed],
+        #             self.tp_size * self.pp_rank + tp_rank,
+        #             self.world_group.cpu_group,
+        #             src=self.world_group.ranks[0],
+        #         )[0]
+        #         logger.info("Seed broadcast success: random_seed=%s", self.random_seed)
+        # except Exception as e:
+        #     logger.exception(
+        #         "Seed broadcast failed: %s | world_group=%s cpu_group=%s device_group=%s",
+        #         e,
+        #         self.world_group,
+        #         getattr(self.world_group, "cpu_group", None),
+        #         getattr(self.world_group, "device_group", None),
+        #     )
+        #     raise
+        # if getattr(self, "random_seed", None) is not None:
+        #     set_random_seed(self.random_seed)
+
+
 
         # A reference make this class has the same member as TpModelWorkerClient
         self.worker = self
@@ -205,10 +257,18 @@ class TpModelWorker:
         return self.model_runner.tp_group
 
     def get_attention_tp_group(self):
-        return self.model_runner.attention_tp_group
+        # return self.model_runner.attention_tp_group
+        try:
+            from sglang.srt.semidisaggregation.semipd.group_provider import (
+                get_attention_tp_group_role_aware,
+            )
+            return get_attention_tp_group_role_aware(self.model_runner.server_args)
+        except Exception:
+            return self.model_runner.attention_tp_group
 
     def get_attention_tp_cpu_group(self):
-        return getattr(self.model_runner.attention_tp_group, "cpu_group", None)
+        # return getattr(self.model_runner.attention_tp_group, "cpu_group", None)
+        return getattr(self.get_attention_tp_group(), "cpu_group", None)
 
     def get_memory_pool(self):
         return (
@@ -247,13 +307,13 @@ class TpModelWorker:
                 next_token_ids = self.model_runner.sample(
                     logits_output, model_worker_batch
                 )
-
             return logits_output, next_token_ids, can_run_cuda_graph
         else:
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            logging.info("no ppgroup last rank")
             return pp_proxy_tensors.tensors, None, can_run_cuda_graph
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):

@@ -30,6 +30,8 @@ import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+import threading
+import threading
 from datetime import timedelta
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -49,13 +51,13 @@ from sglang.srt.utils import (
     is_shm_available,
     supports_custom_op,
 )
-
+from torch.cuda.streams import ExternalStream
 _is_npu = is_npu()
 
 
 @dataclass
 class GraphCaptureContext:
-    stream: torch.cuda.Stream
+    stream: ExternalStream
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -223,6 +225,7 @@ class GroupCoordinator:
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
     ):
+        self.semipd_groupname = group_name # todo
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
@@ -1147,11 +1150,9 @@ _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
 
 _ENABLE_PDMUX_P_TP: bool = False
 
-
 def set_pdmux_status(enable_prefill_multiplexing: bool):
     global _ENABLE_PDMUX_P_TP
     _ENABLE_PDMUX_P_TP = enable_prefill_multiplexing
-
 
 def get_tp_group() -> GroupCoordinator:
     if _ENABLE_PDMUX_P_TP:
@@ -1161,7 +1162,6 @@ def get_tp_group() -> GroupCoordinator:
         return _PDMUX_PREFILL_TP_GROUP
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
-
 
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
@@ -1193,7 +1193,7 @@ get_pipeline_model_parallel_group = get_pp_group
 
 
 @contextmanager
-def graph_capture():
+def graph_capture(graph_capture_context: Optional[GraphCaptureContext] = None):
     """
     `graph_capture` is a context manager which should surround the code that
     is capturing the CUDA graph. Its main purpose is to ensure that the
@@ -1207,10 +1207,17 @@ def graph_capture():
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    with get_tp_group().graph_capture() as context, get_pp_group().graph_capture(
-        context
-    ):
-        yield context
+    if graph_capture_context is None:
+        with get_tp_group().graph_capture() as context, get_pp_group().graph_capture(
+            context
+        ):
+            yield context
+    else:
+        # Reuse the provided context (and its stream) across TP/PP
+        with get_tp_group().graph_capture(graph_capture_context) as context, get_pp_group().graph_capture(
+            context
+        ):
+            yield context
 
 
 logger = logging.getLogger(__name__)
