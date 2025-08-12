@@ -2,10 +2,10 @@ import os
 import sys
 import time
 import pytest
-
+from sglang.srt.server_args import ServerArgs
 
 # --------- Simple local variables (edit as needed) ---------
-MODEL_PATH = "/path/to/your/local/model"  # 修改为本地已下载模型的目录
+MODEL_PATH = "/mnt/DeepSeek-R1-Distill-Qwen-32B"  # 修改为本地已下载模型的目录
 TP_SIZE = 4
 PORT = 33000
 TIMEOUT_S = 180
@@ -38,7 +38,7 @@ def _run_smoke(model_path: str, tp_size: int, port: int):
     from sglang.srt.entrypoints.engine import Engine
 
     engine = Engine(
-        server_args=dict(
+        server_args=ServerArgs(
             model_path=model_path,
             engine_mode="semipd",
             device="cuda",

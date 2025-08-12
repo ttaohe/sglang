@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List
 
-import semi_pd_ipc
+# import semi_pd_ipc
 import torch
 import zmq
 
@@ -65,23 +65,23 @@ DTYPE_TO_ATEN = {
 }
 
 
-def get_ipc_handle(tensor: torch.Tensor):
-    # https://github.com/pytorch/pytorch/blob/cbcc03c2ad11fbf1080f6a1025cc3f7aee0c858d/torch/multiprocessing/reductions.py#L371
-    (
-        device,
-        handle,
-        storage_size_bytes,  # size(in bytes) of the storage
-        storage_offset_bytes,  # offset(in bytes) of the storage in the CUDA allocation
-    ) = tensor.storage()._share_cuda_()[:4]
-    assert storage_size_bytes == tensor.numel() * tensor.element_size()
+# def get_ipc_handle(tensor: torch.Tensor):
+#     # https://github.com/pytorch/pytorch/blob/cbcc03c2ad11fbf1080f6a1025cc3f7aee0c858d/torch/multiprocessing/reductions.py#L371
+#     (
+#         device,
+#         handle,
+#         storage_size_bytes,  # size(in bytes) of the storage
+#         storage_offset_bytes,  # offset(in bytes) of the storage in the CUDA allocation
+#     ) = tensor.storage()._share_cuda_()[:4]
+#     assert storage_size_bytes == tensor.numel() * tensor.element_size()
 
-    return semi_pd_ipc.get_ipc_handle(tensor), storage_offset_bytes
-
-
-def convert_ipc_handle_to_tensor(ipc_handle, size, dtype, device):
-    dtype_str = DTYPE_TO_ATEN[dtype]
-    return semi_pd_ipc.convert_ipc_handle_to_tensor(ipc_handle, size, dtype_str, device)
+#     return semi_pd_ipc.get_ipc_handle(tensor), storage_offset_bytes
 
 
-def get_device_sm_count(rank: int = 0):
-    return semi_pd_ipc.get_device_sm_count(rank)
+# def convert_ipc_handle_to_tensor(ipc_handle, size, dtype, device):
+#     dtype_str = DTYPE_TO_ATEN[dtype]
+#     return semi_pd_ipc.convert_ipc_handle_to_tensor(ipc_handle, size, dtype_str, device)
+
+
+# def get_device_sm_count(rank: int = 0):
+#     return semi_pd_ipc.get_device_sm_count(rank)

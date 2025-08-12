@@ -22,9 +22,9 @@ import threading as td
 import multiprocessing as mp
 from torch.cuda.streams import ExternalStream
 
-from sglang.semi_pd.utils import InstanceRole
+from sglang.srt.semidisaggregation.semipd.utils import InstanceRole
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ImageInputs, Req
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, MultimodalInputs, Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import validate_input_length
@@ -166,8 +166,8 @@ class SemiPDScheduler(Scheduler):
                 return
 
         # Handle multimodal inputs
-        if recv_req.image_inputs is not None:
-            image_inputs = ImageInputs.from_dict(recv_req.image_inputs)
+        if recv_req.mm_inputs is not None:
+            image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
@@ -181,7 +181,7 @@ class SemiPDScheduler(Scheduler):
                 )
                 logger.error(error_msg)
                 req.origin_input_ids = [0]
-                req.image_inputs = None
+                req.mm_inputs = None
                 req.sampling_params.max_new_tokens = 0
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
