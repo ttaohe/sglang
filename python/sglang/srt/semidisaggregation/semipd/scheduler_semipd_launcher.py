@@ -80,6 +80,15 @@ class SchedulerSemiPDLauncher:
         )
         logger.info("Decode scheduler init finished.")
 
+        # Apply semipd TP monkey patch and ensure semipd TP groups exist before waking prefill
+        if getattr(server_args, "engine_mode", "normal") == "semipd":
+            from sglang.srt.semidisaggregation.semipd.parallel_state_semipd import (
+                semipd_tp_groups_initialized,
+                set_semipd_thread_role,
+            )
+            set_semipd_thread_role("decode")
+            semipd_tp_groups_initialized()
+
         if dscheduler.enable_overlap:
             shared_state.decode_model_runner = dscheduler.tp_worker.worker.model_runner
         else:
@@ -92,7 +101,7 @@ class SchedulerSemiPDLauncher:
         else:
             dscheduler.init_cuda_graphs(dstream)
             dscheduler.tp_worker.worker.init_forward_stream(dstream)
-
+        print("decode thread init finished")
         shared_state.decode_ready_event.set()
 
         logger.info("Decode scheduler initialized. Starting event loop...")
@@ -120,10 +129,16 @@ class SchedulerSemiPDLauncher:
             f"Prefill scheduler using max_total_tokens: {shared_state.max_total_num_tokens}"
         )
 
-        # Select duplicate Prefill TP group for prefill thread BEFORE constructing scheduler/model_runner
-        from sglang.srt.distributed.parallel_state import enable_pdmux_tp_for_current_thread
-        enable_pdmux_tp_for_current_thread(True)
+        # Switch to semipd prefill TP group for this thread BEFORE constructing scheduler/model_runner
+        from sglang.srt.semidisaggregation.semipd.parallel_state_semipd import (
+            set_semipd_thread_role,
+            semipd_tp_groups_initialized,
+        )
+        set_semipd_thread_role("prefill")
+        semipd_tp_groups_initialized()
 
+        # 告诉下游不要重复加载权重
+        server_args.skip_model_weight_loading = True
         pscheduler = scheduler_cls(
             server_args, port_args, gpu_id, tp_rank, dp_rank, bypass_load_weight=True
         )

@@ -767,10 +767,8 @@ def run_scheduler_process(
     pstream, dstream = SchedulerSemiPDLauncher.init_streams(
         sm_prefill, sm_decode, tp_rank, engine_mode=getattr(server_args, "engine_mode", "normal"), gpu_id=gpu_id
     )
-    # Ensure duplicate TP group exists (without re-initializing WORLD/TP)
-    if getattr(server_args, "engine_mode", "normal") == "semipd":
-        from sglang.srt.distributed.parallel_state import ensure_pdmux_duplicate_tp_group_if_needed
-        ensure_pdmux_duplicate_tp_group_if_needed()
+    # In semipd, duplicate TP group will be created by the decode thread after
+    # its scheduler is constructed (ensuring _TP exists) and before signaling prefill.
     
     shared_state = SemiPDSchedulerSharedState()
 

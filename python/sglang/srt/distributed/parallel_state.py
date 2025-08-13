@@ -1152,6 +1152,12 @@ _ENABLE_PDMUX_P_TP: bool = False
 _PDMUX_TL = threading.local()
 _PDMUX_INIT_LOCK = threading.Lock()
 
+# --- SemiPD explicit TP groups (decode/prefill) ---
+# For engine_mode=semipd, provide two fully independent TP groups and explicit getters,
+# without relying on thread-local routing.
+_TP_DECODE: Optional[GroupCoordinator] = None
+_TP_PREFILL: Optional[GroupCoordinator] = None
+
 
 def set_pdmux_status(enable_prefill_multiplexing: bool):
     global _ENABLE_PDMUX_P_TP
@@ -1194,21 +1200,78 @@ def ensure_pdmux_duplicate_tp_group_if_needed() -> None:
                 "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
             ),
             group_name="pdmux_prefill_tp",
-            pynccl_use_current_stream=True,
+            # pynccl_use_current_stream=True,  # TODO: ttaohe check this is needed.
         )
         # Align communicator states: disable custom allreduce on duplicate group
         if _PDMUX_PREFILL_TP_GROUP.ca_comm:
             _PDMUX_PREFILL_TP_GROUP.ca_comm.disabled = True
 
 
+def ensure_semipd_tp_groups_initialized() -> None:
+    """Ensure explicit TP groups exist for semipd (decode/prefill).
+
+    - _TP_DECODE will be set to the primary TP group (_TP)
+    - _TP_PREFILL will be created as a duplicate TP group if not present
+    Idempotent and thread-safe.
+    """
+    global _TP_DECODE, _TP_PREFILL
+    with _PDMUX_INIT_LOCK:
+        assert _TP is not None, "Primary TP group must be initialized before semipd"
+        if _TP_DECODE is None:
+            _TP_DECODE = _TP
+        if _TP_PREFILL is None:
+            world_group = get_world_group()
+            backend = torch.distributed.get_backend(world_group.device_group)
+            tp_world_size = _TP.world_size
+            world_size = torch.distributed.get_world_size()
+            assert world_size % tp_world_size == 0
+            num_tp_groups = world_size // tp_world_size
+            group_ranks = [
+                list(range(i * tp_world_size, (i + 1) * tp_world_size))
+                for i in range(num_tp_groups)
+            ]
+            _TP_PREFILL = init_model_parallel_group(
+                group_ranks,
+                world_group.local_rank,
+                backend,
+                use_message_queue_broadcaster=get_bool_env_var(
+                    "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
+                ),
+                group_name="semipd_prefill_tp",
+            )
+            if _TP_PREFILL.ca_comm:
+                _TP_PREFILL.ca_comm.disabled = True
+
+
 def get_tp_group() -> GroupCoordinator:
+    # Backward-compatible default getter. In semipd we recommend using
+    # get_tp_group_decode()/get_tp_group_prefill() explicitly.
     if _ENABLE_PDMUX_P_TP and getattr(_PDMUX_TL, "use_prefill_group", False):
         assert (
             _PDMUX_PREFILL_TP_GROUP is not None
         ), "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
         return _PDMUX_PREFILL_TP_GROUP
+    # Prefer the explicit decode group if present
+    if _TP_DECODE is not None:
+        return _TP_DECODE
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
+
+
+def get_tp_group_decode() -> GroupCoordinator:
+    """Explicit getter for semipd decode TP group."""
+    if _TP_DECODE is None:
+        ensure_semipd_tp_groups_initialized()
+    assert _TP_DECODE is not None
+    return _TP_DECODE
+
+
+def get_tp_group_prefill() -> GroupCoordinator:
+    """Explicit getter for semipd prefill TP group."""
+    if _TP_PREFILL is None:
+        ensure_semipd_tp_groups_initialized()
+    assert _TP_PREFILL is not None
+    return _TP_PREFILL
 
 
 _MOE_EP: Optional[GroupCoordinator] = None

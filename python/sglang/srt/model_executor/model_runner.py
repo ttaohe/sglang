@@ -286,7 +286,8 @@ class ModelRunner:
 
         # Load the model
         self.sampler = Sampler()
-        self.load_model()
+        if not getattr(self.server_args, "skip_model_weight_loading", False):
+            self.load_model()
 
         # Check if the model is using hybrid SWA
         if (
@@ -575,6 +576,17 @@ class ModelRunner:
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
 
         if not self.is_draft_worker:
+            # In semipd, let DECODE线程负责初始化并创建/校验并行组；PREFILL线程跳过该步骤，复用已初始化的组
+            semipd_prefill_thread = False
+            if getattr(self.server_args, "engine_mode", "normal") == "semipd":
+                try:
+                    from sglang.srt.semidisaggregation.semipd import parallel_state_semipd as sps  # type: ignore
+
+                    thread_role = getattr(getattr(sps, "_SEMIPD_TL", object()), "role", None)
+                    semipd_prefill_thread = thread_role == "prefill"
+                except Exception:
+                    semipd_prefill_thread = False
+
             if self.device == "cpu":
                 if _is_cpu_amx_available:
                     # Bind OpenMP threads to CPU cores
@@ -588,29 +600,33 @@ class ModelRunner:
                         "init_cpu_threads_env and shared memory based AllReduce is disabled since intel amx backend is not available"
                     )
 
-            # Only initialize the distributed environment on the target model worker.
-            init_distributed_environment(
-                backend=backend,
-                world_size=self.tp_size * self.pp_size,
-                rank=self.tp_size * self.pp_rank + self.tp_rank,
-                local_rank=self.gpu_id,
-                distributed_init_method=dist_init_method,
-                timeout=self.server_args.dist_timeout,
-            )
-            initialize_model_parallel(
-                tensor_model_parallel_size=self.tp_size,
-                pipeline_model_parallel_size=self.pp_size,
-                expert_model_parallel_size=self.moe_ep_size,
-                duplicate_tp_group=self.server_args.enable_pdmux,
-            )
-            initialize_dp_attention(
-                enable_dp_attention=self.server_args.enable_dp_attention,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-                dp_size=self.server_args.dp_size,
-                moe_dense_tp_size=self.server_args.moe_dense_tp_size,
-                pp_size=self.server_args.pp_size,
-            )
+            # Only initialize the distributed environment on the target model worker (decode thread in semipd)
+            if not semipd_prefill_thread:
+                init_distributed_environment(
+                    backend=backend,
+                    world_size=self.tp_size * self.pp_size,
+                    rank=self.tp_size * self.pp_rank + self.tp_rank,
+                    local_rank=self.gpu_id,
+                    distributed_init_method=dist_init_method,
+                    timeout=self.server_args.dist_timeout,
+                )
+                # Use idempotent ensure API to avoid re-init
+                from sglang.srt.distributed.parallel_state import (
+                    ensure_model_parallel_initialized,
+                )
+                ensure_model_parallel_initialized(
+                    tensor_model_parallel_size=self.tp_size,
+                    expert_model_parallel_size=self.moe_ep_size,
+                    pipeline_model_parallel_size=self.pp_size,
+                )
+                initialize_dp_attention(
+                    enable_dp_attention=self.server_args.enable_dp_attention,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    dp_size=self.server_args.dp_size,
+                    moe_dense_tp_size=self.server_args.moe_dense_tp_size,
+                    pp_size=self.server_args.pp_size,
+                )
 
         min_per_gpu_memory = get_available_gpu_memory(
             self.device,
@@ -642,6 +658,7 @@ class ModelRunner:
         return min_per_gpu_memory
 
     def load_model(self):
+        # 在 semipd prefill 线程下可能会被禁止调用
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
