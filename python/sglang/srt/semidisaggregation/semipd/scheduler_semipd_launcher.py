@@ -71,14 +71,14 @@ class SchedulerSemiPDLauncher:
         dstream: ExternalStream,
         shared_state: SemiPDSchedulerSharedState,
     ):
+        # Select main TP group for decode thread BEFORE constructing scheduler/model_runner
+        from sglang.srt.distributed.parallel_state import enable_pdmux_tp_for_current_thread
+        enable_pdmux_tp_for_current_thread(False)
+
         dscheduler = scheduler_cls(
             server_args, port_args, gpu_id, tp_rank, dp_rank, bypass_load_weight=False
         )
         logger.info("Decode scheduler init finished.")
-
-        # Use main TP group in decode thread
-        from sglang.srt.distributed.parallel_state import enable_pdmux_tp_for_current_thread
-        enable_pdmux_tp_for_current_thread(False)
 
         if dscheduler.enable_overlap:
             shared_state.decode_model_runner = dscheduler.tp_worker.worker.model_runner
@@ -120,14 +120,14 @@ class SchedulerSemiPDLauncher:
             f"Prefill scheduler using max_total_tokens: {shared_state.max_total_num_tokens}"
         )
 
+        # Select duplicate Prefill TP group for prefill thread BEFORE constructing scheduler/model_runner
+        from sglang.srt.distributed.parallel_state import enable_pdmux_tp_for_current_thread
+        enable_pdmux_tp_for_current_thread(True)
+
         pscheduler = scheduler_cls(
             server_args, port_args, gpu_id, tp_rank, dp_rank, bypass_load_weight=True
         )
         logger.info("Prefill scheduler init finished.")
-
-        # Select duplicate Prefill TP group in prefill thread
-        from sglang.srt.distributed.parallel_state import enable_pdmux_tp_for_current_thread
-        enable_pdmux_tp_for_current_thread(True)
 
         if pscheduler.enable_overlap:
             target_runner = pscheduler.tp_worker.worker.model_runner
