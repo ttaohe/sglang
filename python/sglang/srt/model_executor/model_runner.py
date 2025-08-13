@@ -1584,8 +1584,12 @@ class ModelRunner:
                 .cuda()
             )
 
-    def init_cuda_graphs(self):
-        """Capture cuda graphs."""
+    def init_cuda_graphs(self, stream: Optional[torch.cuda.Stream] = None):
+        """Capture cuda graphs.
+
+        If `stream` is provided, capture will be performed on that CUDA stream.
+        Otherwise, a fresh stream will be created by the graph_capture context.
+        """
         self.cuda_graph_runner = None
         self.cuda_graph_mem_usage = 0
 
@@ -1601,7 +1605,13 @@ class ModelRunner:
         logger.info(
             f"Capture cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        self.cuda_graph_runner = CudaGraphRunner(self)
+        # If a stream is provided, pass a GraphCaptureContext so capture happens on that stream
+        if stream is not None:
+            from sglang.srt.distributed.parallel_state import GraphCaptureContext
+            context = GraphCaptureContext(stream)
+            self.cuda_graph_runner = CudaGraphRunner(self, context)
+        else:
+            self.cuda_graph_runner = CudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.cuda_graph_mem_usage = before_mem - after_mem
         logger.info(

@@ -52,6 +52,11 @@ from sglang.srt.managers.scheduler import EmbeddingBatchResult, GenerationBatchR
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 
 from .pdmux_context import create_greenctx_stream_by_percent_py
+from .scheduler_semipd_launcher import (
+    SchedulerSemiPDLauncher,
+    SemiPDSchedulerSharedState,
+)
+from .scheduler_semipd_mixin import SchedulerSemiPDMixin
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
@@ -59,7 +64,7 @@ TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 logger = logging.getLogger(__name__)
 
 
-class SemiPDScheduler(Scheduler):
+class SemiPDScheduler(Scheduler, SchedulerSemiPDMixin):
     def __init__(
         self,
         server_args: ServerArgs,
@@ -79,6 +84,8 @@ class SemiPDScheduler(Scheduler):
             bypass_load_weight,
             instance_role,
         )
+        # initialize semipd stream groups on construction for derived classes
+        self.init_semipd_stream_groups()
 
     def add_to_waiting_queue(self, req: Req):
         if req.is_retracted:
@@ -729,132 +736,6 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 self.running_batch.merge_batch(batch)
 
 
-
-# REFACTOR: Encapsulate all shared state into a dedicated class.
-# This is a much cleaner pattern than using multiple 'nonlocal' variables.
-@dataclass
-class SchedulerSharedState:
-    """Holds state and synchronization objects shared between scheduler threads."""
-    # Data shared from decode to prefill
-    max_total_num_tokens: Optional[int] = None
-    decode_model_runner: Optional[Any] = None
-    
-    # Synchronization
-    decode_ready_event: td.Event = field(default_factory=td.Event)
-
-
-def _share_model_and_buffers(source_runner, target_runner):
-    """Share model weights and KV cache buffers from a source ModelRunner to a target ModelRunner."""
-    target_runner.model = source_runner.model
-
-    src_pool = getattr(source_runner, "token_to_kv_pool", None)
-    tgt_pool = getattr(target_runner, "token_to_kv_pool", None)
-    if src_pool is not None and tgt_pool is not None:
-        # MHA-style: k_buffer, v_buffer
-        if hasattr(src_pool, "k_buffer") and hasattr(src_pool, "v_buffer"):
-            setattr(tgt_pool, "k_buffer", getattr(src_pool, "k_buffer"))
-            setattr(tgt_pool, "v_buffer", getattr(src_pool, "v_buffer"))
-        # MLA-style: kv_buffer
-        elif hasattr(src_pool, "kv_buffer"):
-            setattr(tgt_pool, "kv_buffer", getattr(src_pool, "kv_buffer"))
-
-    # ReqToTokenPool mapping
-    if (
-        hasattr(source_runner, "req_to_token_pool")
-        and hasattr(target_runner, "req_to_token_pool")
-        and hasattr(source_runner.req_to_token_pool, "req_to_token")
-    ):
-        target_runner.req_to_token_pool.req_to_token = (
-            source_runner.req_to_token_pool.req_to_token
-        )
-
-
-# REFACTOR: Pull thread logic into standalone functions for clarity and testability.
-def run_decode_scheduler_thread(
-    server_args: ServerArgs,
-    port_args: PortArgs,
-    gpu_id: int,
-    tp_rank: int,
-    dp_rank: Optional[int],
-    dstream: ExternalStream,
-    shared_state: SchedulerSharedState,
-):
-    """Initializes and runs the event loop for the decode scheduler."""
-    
-    dscheduler = SemiPDDecodeScheduler(
-        server_args, port_args, gpu_id, tp_rank, dp_rank, bypass_load_weight=False
-    )
-    logging.info("Decode scheduler init finished.")
-    
-    # Populate the shared state object
-    if dscheduler.enable_overlap:
-        shared_state.decode_model_runner = dscheduler.tp_worker.worker.model_runner
-    else:
-        shared_state.decode_model_runner = dscheduler.tp_worker.model_runner
-    shared_state.max_total_num_tokens = dscheduler.max_total_num_tokens
-
-    dscheduler.init_attention_backend()
-    dscheduler.init_cuda_graphs(dstream)
-
-    dscheduler.tp_worker.worker.init_forward_stream(dstream)
-    
-    # Signal that decode initialization is complete and data is ready for prefill thread
-    shared_state.decode_ready_event.set()
-    
-    logging.info("Decode scheduler initialized. Starting event loop...")
-    if dscheduler.enable_overlap:
-        dscheduler.event_loop_overlap()
-    else:
-        dscheduler.event_loop_normal()
-    
-
-def run_prefill_scheduler_thread(
-    server_args: ServerArgs,
-    port_args: PortArgs,
-    gpu_id: int,
-    tp_rank: int,
-    dp_rank: Optional[int],
-    pstream: ExternalStream,
-    shared_state: SchedulerSharedState,
-    pipe_writer,
-):
-    """Initializes and runs the event loop for the prefill scheduler."""
-    # Wait for the decode scheduler to be ready
-    shared_state.decode_ready_event.wait()
-    
-    # Use the data prepared by the decode thread
-    server_args.max_total_tokens = shared_state.max_total_num_tokens
-    logging.info(f"Prefill scheduler using max_total_tokens: {shared_state.max_total_num_tokens}")
-    
-    pscheduler = SemiPDPrefillScheduler(
-        server_args, port_args, gpu_id, tp_rank, dp_rank, bypass_load_weight=True
-    )
-    logging.info("Prefill scheduler init finished.")
-
-    if pscheduler.enable_overlap:
-        target_runner = pscheduler.tp_worker.worker.model_runner
-    else:
-        target_runner = pscheduler.tp_worker.model_runner
-
-    # Share model and buffers from the decode scheduler
-    _share_model_and_buffers(
-        source_runner=shared_state.decode_model_runner,
-        target_runner=target_runner,
-    )
-
-    pscheduler.init_attention_backend()
-
-    pscheduler.tp_worker.init_forward_stream(pstream)
-        
-    pipe_writer.send({
-            "status": "ready",
-            "max_total_num_tokens": shared_state.max_total_num_tokens,
-            "max_req_input_len": pscheduler.max_req_input_len,
-        })
-    
-    logging.info("Prefill scheduler initialized. Starting event loop...")
-    pscheduler.event_loop_normal()
-
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -883,21 +764,23 @@ def run_scheduler_process(
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
 
     # --- Stream and State Initialization ---
-    pstream, dstream = create_greenctx_stream_by_percent_py(sm_prefill, sm_decode, tp_rank)
+    pstream, dstream = SchedulerSemiPDLauncher.init_streams(
+        sm_prefill, sm_decode, tp_rank, engine_mode=getattr(server_args, "engine_mode", "normal"), gpu_id=gpu_id
+    )
     
-    shared_state = SchedulerSharedState()
+    shared_state = SemiPDSchedulerSharedState()
 
     try:
         # --- Thread Creation and Startup ---
         d_thread = td.Thread(
-            target=run_decode_scheduler_thread,
+            target=SchedulerSemiPDLauncher.run_decode_thread,
             name="decode_scheduler",
-            args=(server_args, port_args, gpu_id, tp_rank, dp_rank, dstream, shared_state),
+            args=(SemiPDDecodeScheduler, server_args, port_args, gpu_id, tp_rank, dp_rank, dstream, shared_state),
         )
         p_thread = td.Thread(
-            target=run_prefill_scheduler_thread,
+            target=SchedulerSemiPDLauncher.run_prefill_thread,
             name="prefill_scheduler",
-            args=(server_args, port_args, gpu_id, tp_rank, dp_rank, pstream, shared_state, pipe_writer),
+            args=(SemiPDPrefillScheduler, server_args, port_args, gpu_id, tp_rank, dp_rank, pstream, shared_state, pipe_writer),
         )
         
         d_thread.start()
