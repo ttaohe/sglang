@@ -1150,6 +1150,7 @@ _ENABLE_PDMUX_P_TP: bool = False
 
 # thread-local switch to select duplicate TP group for current thread
 _PDMUX_TL = threading.local()
+_PDMUX_INIT_LOCK = threading.Lock()
 
 
 def set_pdmux_status(enable_prefill_multiplexing: bool):
@@ -1170,33 +1171,34 @@ def ensure_pdmux_duplicate_tp_group_if_needed() -> None:
     Safe to call multiple times.
     """
     global _PDMUX_PREFILL_TP_GROUP
-    if _PDMUX_PREFILL_TP_GROUP is not None:
-        return
-    # Primary TP must already be initialized by engine entrypoint
-    assert _TP is not None, "tensor model parallel group is not initialized"
-    world_group = get_world_group()
-    backend = torch.distributed.get_backend(world_group.device_group)
-    tp_world_size = _TP.world_size
-    world_size = torch.distributed.get_world_size()
-    assert world_size % tp_world_size == 0
-    num_tp_groups = world_size // tp_world_size
-    group_ranks = [
-        list(range(i * tp_world_size, (i + 1) * tp_world_size))
-        for i in range(num_tp_groups)
-    ]
-    _PDMUX_PREFILL_TP_GROUP = init_model_parallel_group(
-        group_ranks,
-        world_group.local_rank,
-        backend,
-        use_message_queue_broadcaster=get_bool_env_var(
-            "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
-        ),
-        group_name="pdmux_prefill_tp",
-        pynccl_use_current_stream=True,
-    )
-    # Align communicator states: disable custom allreduce on duplicate group
-    if _PDMUX_PREFILL_TP_GROUP.ca_comm:
-        _PDMUX_PREFILL_TP_GROUP.ca_comm.disabled = True
+    with _PDMUX_INIT_LOCK:
+        if _PDMUX_PREFILL_TP_GROUP is not None:
+            return
+        # Primary TP must already be initialized by engine entrypoint
+        assert _TP is not None, "tensor model parallel group is not initialized"
+        world_group = get_world_group()
+        backend = torch.distributed.get_backend(world_group.device_group)
+        tp_world_size = _TP.world_size
+        world_size = torch.distributed.get_world_size()
+        assert world_size % tp_world_size == 0
+        num_tp_groups = world_size // tp_world_size
+        group_ranks = [
+            list(range(i * tp_world_size, (i + 1) * tp_world_size))
+            for i in range(num_tp_groups)
+        ]
+        _PDMUX_PREFILL_TP_GROUP = init_model_parallel_group(
+            group_ranks,
+            world_group.local_rank,
+            backend,
+            use_message_queue_broadcaster=get_bool_env_var(
+                "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
+            ),
+            group_name="pdmux_prefill_tp",
+            pynccl_use_current_stream=True,
+        )
+        # Align communicator states: disable custom allreduce on duplicate group
+        if _PDMUX_PREFILL_TP_GROUP.ca_comm:
+            _PDMUX_PREFILL_TP_GROUP.ca_comm.disabled = True
 
 
 def get_tp_group() -> GroupCoordinator:
