@@ -76,13 +76,16 @@ class SchedulerSemiPDLauncher:
         )
         logger.info("Decode scheduler init finished.")
 
+        # Use main TP group in decode thread
+        from sglang.srt.distributed.parallel_state import enable_pdmux_tp_for_current_thread
+        enable_pdmux_tp_for_current_thread(False)
+
         if dscheduler.enable_overlap:
             shared_state.decode_model_runner = dscheduler.tp_worker.worker.model_runner
         else:
             shared_state.decode_model_runner = dscheduler.tp_worker.model_runner
         shared_state.max_total_num_tokens = dscheduler.max_total_num_tokens
 
-        dscheduler.init_attention_backend()
         # Delegate per-role forward stream binding to mixin
         if hasattr(dscheduler, "init_forward_streams") and getattr(server_args, "engine_mode", "normal") == "semipd":
             dscheduler.init_forward_streams()
@@ -122,6 +125,10 @@ class SchedulerSemiPDLauncher:
         )
         logger.info("Prefill scheduler init finished.")
 
+        # Select duplicate Prefill TP group in prefill thread
+        from sglang.srt.distributed.parallel_state import enable_pdmux_tp_for_current_thread
+        enable_pdmux_tp_for_current_thread(True)
+
         if pscheduler.enable_overlap:
             target_runner = pscheduler.tp_worker.worker.model_runner
         else:
@@ -131,7 +138,6 @@ class SchedulerSemiPDLauncher:
             source_runner=shared_state.decode_model_runner, target_runner=target_runner
         )
 
-        pscheduler.init_attention_backend()
         # Delegate per-role forward stream binding to mixin
         if hasattr(pscheduler, "init_forward_streams") and getattr(server_args, "engine_mode", "normal") == "semipd":
             pscheduler.init_forward_streams()

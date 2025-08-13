@@ -767,6 +767,16 @@ def run_scheduler_process(
     pstream, dstream = SchedulerSemiPDLauncher.init_streams(
         sm_prefill, sm_decode, tp_rank, engine_mode=getattr(server_args, "engine_mode", "normal"), gpu_id=gpu_id
     )
+    # Initialize duplicate TP group for semipd so prefill thread can use its own TP
+    if getattr(server_args, "engine_mode", "normal") == "semipd":
+        from sglang.srt.distributed.parallel_state import initialize_model_parallel, get_world_group
+        initialize_model_parallel(
+            tensor_model_parallel_size=server_args.tp_size,
+            expert_model_parallel_size=server_args.ep_size,
+            pipeline_model_parallel_size=server_args.pp_size,
+            backend=torch.distributed.get_backend(get_world_group().device_group),
+            duplicate_tp_group=True,
+        )
     
     shared_state = SemiPDSchedulerSharedState()
 

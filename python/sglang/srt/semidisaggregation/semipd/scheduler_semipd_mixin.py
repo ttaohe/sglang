@@ -40,8 +40,7 @@ class SchedulerSemiPDMixin:
                 else self.tp_worker.model_runner
             )
             # Capture graphs on the selected stream without changing core code
-            with torch.cuda.stream(decode_stream):
-                runner.init_cuda_graphs()
+            runner.init_cuda_graphs(decode_stream)
         elif getattr(self, "instance_role", None) == InstanceRole.PREFILL:
             # Prefill runs without overlap on the framework-selected prefill stream
             self.enable_overlap = False
