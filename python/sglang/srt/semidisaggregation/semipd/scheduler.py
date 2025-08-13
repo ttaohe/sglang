@@ -50,13 +50,6 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import EmbeddingBatchResult, GenerationBatchResult
 
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.mem_cache.memory_pool import (
-    DoubleSparseTokenToKVPool,
-    MHATokenToKVPool,
-    MLATokenToKVPool,
-    ReqToTokenPool,
-    TokenToKVPoolAllocator,
-)
 
 from .pdmux_context import create_greenctx_stream_by_percent_py
 
@@ -529,20 +522,24 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             return None
 
         running_bs = len(self.running_batch.reqs)
-        if running_bs >= self.max_running_requests:
+        # Ignore the check if self.chunked_req is not None.
+        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
+        # as the space for the chunked request has just been released.
+        # In PP case, a chunked req can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
+        # Instead, we should always allow chunked request to be added, otherwise, there will be a memory leak.
+        if self.get_num_allocatable_reqs(running_bs) <= 0 and not self.chunked_req:
             self.running_batch.batch_is_full = True
             return None
 
         if self.enable_hierarchical_cache:
-            # check for completion of hierarchical cache activities to release memory
-            self.tree_cache.writing_check()
-            self.tree_cache.loading_check()
+            self.tree_cache.check_hicache_events()
 
         # Get priority queue
-        prefix_computed = self.policy.calc_priority(self.waiting_queue)
+        self.policy.calc_priority(self.waiting_queue)
 
         # Prefill policy
         adder = PrefillAdder(
+            self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
@@ -556,8 +553,8 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
-        if self.lora_paths:
-            lora_set = set([req.lora_path for req in self.running_batch.reqs])
+        if self.enable_lora:
+            lora_set = set([req.lora_id for req in self.running_batch.reqs])
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -566,34 +563,27 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 logging.info("continue because not in rids")
                 continue
 
-            if (
-                self.lora_paths
-                and len(
-                    lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
-                )
-                > self.max_loras_per_batch
+            if self.enable_lora and not self.tp_worker.can_run_lora_batch(
+                lora_set
+                | set([req.lora_id for req in adder.can_run_list])
+                | set([req.lora_id])
             ):
-                logging.info("lora_paths self.running_batch.batch_is_full= True")
                 self.running_batch.batch_is_full = True
                 break
 
-            if running_bs + len(adder.can_run_list) >= self.max_running_requests:
-                logging.info("running_bs + len(adder.can_run_list) >= self.max_running_requests self.running_batch.batch_is_full= True")
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
                 break
 
-            req.init_next_round_input(
-                None if prefix_computed else self.tree_cache,
-                self.enable_hierarchical_cache,
-            )
+            if self.enable_hicache_storage:
+                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                if not prefetch_done:
+                    # skip staging requests that are ongoing prefetch
+                    continue
 
-            res = adder.add_one_req(
-                req, self.chunked_req, self.enable_hierarchical_cache
-            )
+            req.init_next_round_input(self.tree_cache)
+            res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
 
-            # logging.info(f"res: {res}")
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -614,12 +604,10 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
+
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
-
-        if self.enable_hierarchical_cache:
-            self.tree_cache.read_to_load_cache()
 
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
@@ -642,7 +630,13 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            chunked_req=self.chunked_req,
         )
+        if self.enable_hierarchical_cache:
+            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+            new_batch.hicache_consumer_index = (
+                self.tree_cache.ready_to_load_host_cache()
+            )
         new_batch.prepare_for_extend()
         # Semi-PD
         self.scheduled_prefill_batches.append(new_batch)
@@ -752,16 +746,27 @@ class SchedulerSharedState:
 def _share_model_and_buffers(source_runner, target_runner):
     """Share model weights and KV cache buffers from a source ModelRunner to a target ModelRunner."""
     target_runner.model = source_runner.model
-    
-    if isinstance(source_runner.token_to_kv_pool, MHATokenToKVPool):
-        assert isinstance(target_runner.token_to_kv_pool, MHATokenToKVPool)
-        target_runner.token_to_kv_pool.k_buffer = source_runner.token_to_kv_pool.k_buffer
-        target_runner.token_to_kv_pool.v_buffer = source_runner.token_to_kv_pool.v_buffer
-    elif isinstance(source_runner.token_to_kv_pool, MLATokenToKVPool):
-        assert isinstance(target_runner.token_to_kv_pool, MLATokenToKVPool)
-        target_runner.token_to_kv_pool.kv_buffer = source_runner.token_to_kv_pool.kv_buffer
-    
-    target_runner.req_to_token_pool.req_to_token = source_runner.req_to_token_pool.req_to_token
+
+    src_pool = getattr(source_runner, "token_to_kv_pool", None)
+    tgt_pool = getattr(target_runner, "token_to_kv_pool", None)
+    if src_pool is not None and tgt_pool is not None:
+        # MHA-style: k_buffer, v_buffer
+        if hasattr(src_pool, "k_buffer") and hasattr(src_pool, "v_buffer"):
+            setattr(tgt_pool, "k_buffer", getattr(src_pool, "k_buffer"))
+            setattr(tgt_pool, "v_buffer", getattr(src_pool, "v_buffer"))
+        # MLA-style: kv_buffer
+        elif hasattr(src_pool, "kv_buffer"):
+            setattr(tgt_pool, "kv_buffer", getattr(src_pool, "kv_buffer"))
+
+    # ReqToTokenPool mapping
+    if (
+        hasattr(source_runner, "req_to_token_pool")
+        and hasattr(target_runner, "req_to_token_pool")
+        and hasattr(source_runner.req_to_token_pool, "req_to_token")
+    ):
+        target_runner.req_to_token_pool.req_to_token = (
+            source_runner.req_to_token_pool.req_to_token
+        )
 
 
 # REFACTOR: Pull thread logic into standalone functions for clarity and testability.
