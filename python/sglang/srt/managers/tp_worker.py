@@ -257,7 +257,7 @@ class TpModelWorker:
         return self.model_runner.tp_group
 
     def get_attention_tp_group(self):
-        return self.model_runner.attention_tp_group
+        # return self.model_runner.attention_tp_group
         try:
             from sglang.srt.semidisaggregation.semipd.group_provider import (
                 get_attention_tp_group_role_aware,

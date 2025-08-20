@@ -141,10 +141,6 @@ class Engine(EngineBase):
         self.send_to_rpc = get_zmq_socket(
             context, zmq.DEALER, self.port_args.rpc_ipc_name, True
         )
-        context = zmq.Context(2)
-        self.send_to_rpc = get_zmq_socket(
-            context, zmq.DEALER, self.port_args.rpc_ipc_name, True
-        )
 
     def generate(
         self,
@@ -878,8 +874,3 @@ def _launch_subprocesses(
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     
     return tokenizer_manager, template_manager, scheduler_info
-
-
-def _launch_semipd_gtx_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dict]:
-    # Deprecated: unified into _launch_subprocesses via engine_mode switch.
-    raise NotImplementedError("Use engine_mode=semipd with _launch_subprocesses instead.")

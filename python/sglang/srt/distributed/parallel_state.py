@@ -1154,19 +1154,12 @@ def set_pdmux_status(enable_prefill_multiplexing: bool):
     global _ENABLE_PDMUX_P_TP
     _ENABLE_PDMUX_P_TP = enable_prefill_multiplexing
 
-def enable_pdmux_tp_for_current_thread(enable: bool):
-    """Select duplicate Prefill TP group in current thread when enabled."""
-    _PDMUX_TL.use_prefill_group = enable
-
 def get_tp_group() -> GroupCoordinator:
-    if _ENABLE_PDMUX_P_TP and getattr(_PDMUX_TL, "use_prefill_group", False):
+    if _ENABLE_PDMUX_P_TP:
         assert (
             _PDMUX_PREFILL_TP_GROUP is not None
         ), "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
         return _PDMUX_PREFILL_TP_GROUP
-    # Prefer the explicit decode group if present
-    if _TP_DECODE is not None:
-        return _TP_DECODE
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
 
