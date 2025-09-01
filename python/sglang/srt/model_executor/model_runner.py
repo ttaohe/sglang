@@ -38,6 +38,11 @@ from sglang.srt.distributed import (
     initialize_model_parallel,
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
+    set_tp_group_for_current_thread,
+    set_pp_group_for_current_thread,
+    set_moe_tp_group_for_current_thread,
+    set_moe_ep_group_for_current_thread
+    
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.eplb.eplb_manager import EPLBManager
@@ -80,6 +85,14 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
+)
+
+# Import Semi-PD thread-safe allocators
+from sglang.srt.semidisaggregation.semipd.not_used_semi_token_to_kv_pool_allocator import (
+    SemiAscendPagedTokenToKVPoolAllocator,
+    SemiPagedTokenToKVPoolAllocator,
+    SemiSWATokenToKVPoolAllocator,
+    SemiTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import (
     AscendMLAPagedTokenToKVPool,
@@ -288,59 +301,66 @@ class ModelRunner:
         self.sampler = Sampler()
         self.load_model()
 
-        # Check if the model is using hybrid SWA
-        if (
-            not self.server_args.disable_hybrid_swa_memory
-            and self.sliding_window_size is not None
-            and self.sliding_window_size > 0
-        ):
-            architectures = self.model_config.hf_config.architectures
-            if architectures and not any("Llama4" in arch for arch in architectures):
-                self.is_hybrid = self.model_config.is_hybrid = True
+        from sglang.srt.semidisaggregation.semipd.semi_scheduler_launcher import instance_role
+        from sglang.srt.semidisaggregation.semipd.utils import InstanceRole
 
-        # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
-        # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
-        # determine the number of layers.
-        model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None
-        model_num_layers = (
-            self.model_config.num_nextn_predict_layers
-            if self.is_draft_worker and model_has_mtp_layers
-            else self.model_config.num_hidden_layers
-        )
-        self.start_layer = getattr(self.model, "start_layer", 0)
-        self.end_layer = getattr(self.model, "end_layer", model_num_layers)
-        self.num_effective_layers = self.end_layer - self.start_layer
-        assert (not model_has_mtp_layers) or (
-            self.num_effective_layers == model_num_layers
-        ), "PP is not compatible with MTP models."
 
-        # Apply torchao quantization
-        torchao_applied = getattr(self.model, "torchao_applied", False)
-        # In layered loading, torchao may have been applied
-        if not torchao_applied:
-            apply_torchao_config_to_model(
-                self.model, global_server_args_dict["torchao_config"]
+        if (getattr(self.server_args, "engine_mode", "normal") == "semipd" and instance_role.role == InstanceRole.DECODE)  or getattr(self.server_args, "engine_mode", "normal") == "normal" :
+            # Check if the model is using hybrid SWA
+            if (
+                not self.server_args.disable_hybrid_swa_memory
+                and self.sliding_window_size is not None
+                and self.sliding_window_size > 0
+            ):
+                architectures = self.model_config.hf_config.architectures
+                if architectures and not any("Llama4" in arch for arch in architectures):
+                    self.is_hybrid = self.model_config.is_hybrid = True
+
+            # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
+            # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
+            # determine the number of layers.
+            model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None
+            model_num_layers = (
+                self.model_config.num_nextn_predict_layers
+                if self.is_draft_worker and model_has_mtp_layers
+                else self.model_config.num_hidden_layers
+            )
+            self.start_layer = getattr(self.model, "start_layer", 0)
+            self.end_layer = getattr(self.model, "end_layer", model_num_layers)
+            self.num_effective_layers = self.end_layer - self.start_layer
+            assert (not model_has_mtp_layers) or (
+                self.num_effective_layers == model_num_layers
+            ), "PP is not compatible with MTP models."
+
+            # Apply torchao quantization
+            torchao_applied = getattr(self.model, "torchao_applied", False)
+            # In layered loading, torchao may have been applied
+            if not torchao_applied:
+                apply_torchao_config_to_model(
+                    self.model, global_server_args_dict["torchao_config"]
+                )
+
+            # Apply torch TP if the model supports it
+            supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
+            if self.tp_size > 1 and supports_torch_tp:
+                self.apply_torch_tp()
+
+            # Init lora
+            if server_args.enable_lora:
+                self.init_lora_manager()
+
+            # Init memory pool and attention backends
+            self.init_memory_pool(
+                min_per_gpu_memory,
+                server_args.max_running_requests,
+                server_args.max_total_tokens,
             )
 
-        # Apply torch TP if the model supports it
-        supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
-        if self.tp_size > 1 and supports_torch_tp:
-            self.apply_torch_tp()
-
-        # Init lora
-        if server_args.enable_lora:
-            self.init_lora_manager()
-
-        # Init memory pool and attention backends
-        self.init_memory_pool(
-            min_per_gpu_memory,
-            server_args.max_running_requests,
-            server_args.max_total_tokens,
-        )
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
-            self.init_cuda_graphs()
+            if server_args.engine_mode == "normal":
+                self.init_cuda_graphs()
         else:
             self.cuda_graph_runner = None
             self.cuda_graph_mem_usage = 0
@@ -597,12 +617,18 @@ class ModelRunner:
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
             )
-            initialize_model_parallel(
+            self.tp_group, self.moe_ep_group, self.moe_tp_group, self.pp_group = initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
             )
+
+            set_tp_group_for_current_thread(self.tp_group)
+            set_pp_group_for_current_thread(self.pp_group)
+            set_moe_ep_group_for_current_thread(self.moe_ep_group)
+            set_moe_tp_group_for_current_thread(self.moe_tp_group)
+
             initialize_dp_attention(
                 enable_dp_attention=self.server_args.enable_dp_attention,
                 tp_rank=self.tp_rank,
@@ -618,7 +644,7 @@ class ModelRunner:
             distributed=get_world_group().world_size > 1,
             cpu_group=get_world_group().cpu_group,
         )
-        self.tp_group = get_tp_group()
+        # self.tp_group = get_tp_group()
         self.attention_tp_group = get_attention_tp_group()
 
         # Check memory for tensor parallelism
@@ -675,17 +701,26 @@ class ModelRunner:
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
 
+        if getattr(self.server_args, "skip_model_weight_loading", False):
+            try:
+                from sglang.srt.semidisaggregation.semipd.runner import adopt_from_registered_decode_if_needed
+                adopt_from_registered_decode_if_needed(self)
+                logger.info("Skip weight loading; adopted decode runner successfully.")
+            except Exception:
+                logger.warning("Skip weight loading; adopt decode runner failed.")            
+
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
-            self.model = get_model(
-                model_config=self.model_config,
-                load_config=self.load_config,
-                device_config=DeviceConfig(self.device),
-            )
+            if not hasattr(self, "model"):
+                self.model = get_model(
+                    model_config=self.model_config,
+                    load_config=self.load_config,
+                    device_config=DeviceConfig(self.device),
+                )
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
@@ -1351,47 +1386,128 @@ class ModelRunner:
 
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
+            # Use thread-safe allocators for Semi-PD mode
+            is_semipd_mode = getattr(self.server_args, "engine_mode", "normal") == "semipd"
+            
+            # if self.page_size == 1:
+            #     if self.is_hybrid:
+            #         if is_semipd_mode:
+            #             self.token_to_kv_pool_allocator = SemiSWATokenToKVPoolAllocator(
+            #                 self.full_max_total_num_tokens,
+            #                 self.swa_max_total_num_tokens,
+            #                 dtype=self.kv_cache_dtype,
+            #                 device=self.device,
+            #                 kvcache=self.token_to_kv_pool,
+            #                 need_sort=need_sort,
+            #             )
+            #         else:
+            #             self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+            #                 self.full_max_total_num_tokens,
+            #                 self.swa_max_total_num_tokens,
+            #                 dtype=self.kv_cache_dtype,
+            #                 device=self.device,
+            #                 kvcache=self.token_to_kv_pool,
+            #                 need_sort=need_sort,
+            #             )
+            #     else:
+            #         if is_semipd_mode:
+            #             self.token_to_kv_pool_allocator = SemiTokenToKVPoolAllocator(
+            #                 self.max_total_num_tokens,
+            #                 dtype=self.kv_cache_dtype,
+            #                 device=self.device,
+            #                 kvcache=self.token_to_kv_pool,
+            #                 need_sort=need_sort,
+            #             )
+            #         else:
+            #             self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+            #                 self.max_total_num_tokens,
+            #                 dtype=self.kv_cache_dtype,
+            #                 device=self.device,
+            #                 kvcache=self.token_to_kv_pool,
+            #                 need_sort=need_sort,
+            #             )
+            # else:
+            #     if not _is_npu:
+            #         if is_semipd_mode:
+            #             self.token_to_kv_pool_allocator = SemiPagedTokenToKVPoolAllocator(
+            #                 self.max_total_num_tokens,
+            #                 page_size=self.page_size,
+            #                 dtype=self.kv_cache_dtype,
+            #                 device=self.device,
+            #                 kvcache=self.token_to_kv_pool,
+            #                 need_sort=need_sort,
+            #             )
+            #         else:
+            #             self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+            #                 self.max_total_num_tokens,
+            #                 page_size=self.page_size,
+            #                 dtype=self.kv_cache_dtype,
+            #                 device=self.device,
+            #                 kvcache=self.token_to_kv_pool,
+            #                 need_sort=need_sort,
+            #             )
+            #     else:
+            #         if is_semipd_mode:
+            #             self.token_to_kv_pool_allocator = SemiAscendPagedTokenToKVPoolAllocator(
+            #                 self.max_total_num_tokens,
+            #                 page_size=self.page_size,
+            #                 dtype=self.kv_cache_dtype,
+            #                 device=self.device,
+            #                 kvcache=self.token_to_kv_pool,
+            #                 need_sort=need_sort,
+            #             )
+            #         else:
+            #             self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
+            #                 self.max_total_num_tokens,
+            #                 page_size=self.page_size,
+            #                 dtype=self.kv_cache_dtype,
+            #                 device=self.device,
+            #                 kvcache=self.token_to_kv_pool,
+            #                 need_sort=need_sort,
+            #             )
+
             if self.page_size == 1:
                 if self.is_hybrid:
-                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
-                        self.full_max_total_num_tokens,
-                        self.swa_max_total_num_tokens,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                        need_sort=need_sort,
-                    )
+                        self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                            self.full_max_total_num_tokens,
+                            self.swa_max_total_num_tokens,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
                 else:
-                    self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                        need_sort=need_sort,
-                    )
+                        self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                            self.max_total_num_tokens,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
             else:
                 if not _is_npu:
-                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                        need_sort=need_sort,
-                    )
+                        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                            self.max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
                 else:
-                    self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                        need_sort=need_sort,
-                    )
+                        self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
+                            self.max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
         else:
             assert self.is_draft_worker
-
+        import threading
         logger.info(
+            f"thread: {threading.current_thread().name}"
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )

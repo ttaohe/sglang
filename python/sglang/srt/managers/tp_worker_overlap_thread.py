@@ -23,6 +23,11 @@ from typing import Optional, Tuple
 import psutil
 import torch
 
+from sglang.srt.distributed.parallel_state import (
+    capture_parallel_groups_from_current_thread,
+    apply_parallel_groups_to_current_thread,
+)
+
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -82,8 +87,13 @@ class TpModelWorkerClient:
         self.input_queue = Queue()
         self.output_queue = Queue()
         self.forward_stream = torch.get_device_module(self.device).Stream()
+        # 捕获父线程中的并行组上下文（thread-local）
+        _parallel_groups_ctx = capture_parallel_groups_from_current_thread()
+        # 将上下文应用到新线程中，并在新线程入口首先恢复 thread-local
         self.forward_thread = threading.Thread(
-            target=self.forward_thread_func,
+            target=self._forward_thread_entry,
+            args=(_parallel_groups_ctx,),
+            name=f"forward-thread-tp{tp_rank}-gpu{gpu_id}",
         )
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()
@@ -134,6 +144,11 @@ class TpModelWorkerClient:
 
     def get_kv_cache(self):
         return self.worker.model_runner.token_to_kv_pool
+
+    def _forward_thread_entry(self, groups_ctx):
+        # 在线程启动的最开始，重建 thread-local 的并行组上下文（tp/pp/moe）
+        apply_parallel_groups_to_current_thread(groups_ctx)
+        self.forward_thread_func()
 
     def forward_thread_func(self):
         try:

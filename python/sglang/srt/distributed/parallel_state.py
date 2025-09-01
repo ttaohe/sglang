@@ -39,6 +39,9 @@ import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
+import threading
+from torch.cuda.streams import ExternalStream
+
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
@@ -55,7 +58,7 @@ _is_npu = is_npu()
 
 @dataclass
 class GraphCaptureContext:
-    stream: torch.cuda.Stream
+    stream: ExternalStream
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -1139,8 +1142,59 @@ def init_model_parallel_group(
         group_name=group_name,
     )
 
+_thread_local_groups = threading.local()
 
-_TP: Optional[GroupCoordinator] = None
+def set_tp_group_for_current_thread(tp_group: GroupCoordinator) -> None:
+    _thread_local_groups.tp_group = tp_group
+    logging.info(f"set thread-local tp groups Thread name: {threading.current_thread().name}")
+def set_pp_group_for_current_thread(pp_group: GroupCoordinator) -> None:
+    _thread_local_groups.pp_group = pp_group
+    logging.info(f"set thread-local pp groups Thread name: {threading.current_thread().name}")
+def set_moe_tp_group_for_current_thread(moe_tp_group: GroupCoordinator) -> None:
+    _thread_local_groups.moe_tp_group = moe_tp_group
+    logging.info(f"set thread-local moe_tp groups Thread name: {threading.current_thread().name}")
+def set_moe_ep_group_for_current_thread(moe_ep_group: GroupCoordinator) -> None:
+    _thread_local_groups.moe_ep_group = moe_ep_group
+    logging.info(f"set thread-local moe_ep groups Thread name: {threading.current_thread().name}")
+
+@dataclass
+class ThreadParallelGroups:
+    tp_group: Optional[GroupCoordinator] = None
+    pp_group: Optional[GroupCoordinator] = None
+    moe_tp_group: Optional[GroupCoordinator] = None
+    moe_ep_group: Optional[GroupCoordinator] = None
+
+
+def capture_parallel_groups_from_current_thread() -> "ThreadParallelGroups":
+    """
+    捕获当前线程的并行组上下文（thread-local 中的 tp/pp/moe_tp/moe_ep）。
+    注意：未设置的字段保持为 None，避免在父线程未完成初始化时抛异常。
+    """
+    groups = ThreadParallelGroups()
+    if hasattr(_thread_local_groups, "tp_group"):
+        groups.tp_group = _thread_local_groups.tp_group
+    if hasattr(_thread_local_groups, "pp_group"):
+        groups.pp_group = _thread_local_groups.pp_group
+    if hasattr(_thread_local_groups, "moe_tp_group"):
+        groups.moe_tp_group = _thread_local_groups.moe_tp_group
+    if hasattr(_thread_local_groups, "moe_ep_group"):
+        groups.moe_ep_group = _thread_local_groups.moe_ep_group
+    return groups
+
+
+def apply_parallel_groups_to_current_thread(groups: "ThreadParallelGroups") -> None:
+    """
+    将捕获的并行组上下文应用到当前线程（写入 thread-local）。
+    对 None 字段跳过设置，避免覆盖已有有效值或写入 None。
+    """
+    if groups.tp_group is not None:
+        set_tp_group_for_current_thread(groups.tp_group)
+    if groups.pp_group is not None:
+        set_pp_group_for_current_thread(groups.pp_group)
+    if groups.moe_tp_group is not None:
+        set_moe_tp_group_for_current_thread(groups.moe_tp_group)
+    if groups.moe_ep_group is not None:
+        set_moe_ep_group_for_current_thread(groups.moe_ep_group)
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
@@ -1152,40 +1206,55 @@ def set_pdmux_status(enable_prefill_multiplexing: bool):
     global _ENABLE_PDMUX_P_TP
     _ENABLE_PDMUX_P_TP = enable_prefill_multiplexing
 
-
 def get_tp_group() -> GroupCoordinator:
     if _ENABLE_PDMUX_P_TP:
         assert (
             _PDMUX_PREFILL_TP_GROUP is not None
         ), "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
         return _PDMUX_PREFILL_TP_GROUP
-    assert _TP is not None, "tensor model parallel group is not initialized"
-    return _TP
+    # 使用 hasattr 检查当前线程是否已经设置了 tp_group
+    if not hasattr(_thread_local_groups, 'tp_group'):
+        raise RuntimeError(
+            "Tensor model parallel group is not initialized for the current thread. "
+            f"(Thread name: {threading.current_thread().name})"
+        )
+    
+    return _thread_local_groups.tp_group
 
-
-_MOE_EP: Optional[GroupCoordinator] = None
-_MOE_TP: Optional[GroupCoordinator] = None
 
 
 def get_moe_ep_group() -> GroupCoordinator:
-    assert _MOE_EP is not None, "expert model parallel group is not initialized"
-    return _MOE_EP
-
+    # 使用 hasattr 检查当前线程是否已经设置了 moe_ep_group
+    if not hasattr(_thread_local_groups, 'moe_ep_group'):
+        raise RuntimeError(
+            "Tensor model parallel group is not initialized for the current thread. "
+            f"(Thread name: {threading.current_thread().name})"
+        )
+    
+    return _thread_local_groups.moe_ep_group
 
 def get_moe_tp_group() -> GroupCoordinator:
-    assert _MOE_TP is not None, "expert model parallel group is not initialized"
-    return _MOE_TP
-
+    # 使用 hasattr 检查当前线程是否已经设置了 moe_tp_group
+    if not hasattr(_thread_local_groups, 'moe_tp_group'):
+        raise RuntimeError(
+            "Tensor model parallel group is not initialized for the current thread. "
+            f"(Thread name: {threading.current_thread().name})"
+        )
+    
+    return _thread_local_groups.moe_tp_group
 
 # kept for backward compatibility
 get_tensor_model_parallel_group = get_tp_group
 
-_PP: Optional[GroupCoordinator] = None
-
-
 def get_pp_group() -> GroupCoordinator:
-    assert _PP is not None, "pipeline model parallel group is not initialized"
-    return _PP
+    # 使用 hasattr 检查当前线程是否已经设置了 pp_group
+    if not hasattr(_thread_local_groups, 'pp_group'):
+        raise RuntimeError(
+            "Tensor model parallel group is not initialized for the current thread. "
+            f"(Thread name: {threading.current_thread().name})"
+        )
+    
+    return _thread_local_groups.pp_group
 
 
 # kept for backward compatibility
@@ -1290,136 +1359,100 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    role_name: str = "default",
 ) -> None:
     """
-    Initialize model parallel groups.
-
-    Arguments:
-        tensor_model_parallel_size: number of GPUs used for tensor model
-            parallelism.
-        pipeline_model_parallel_size: number of GPUs used for pipeline model
-            parallelism.
-
-    Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
-    use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
-    the model pipeline. The present function will
-    create 4 tensor model-parallel groups and 2 pipeline model-parallel groups:
-        4 tensor model-parallel groups:
-            [g0, g1], [g2, g3], [g4, g5], [g6, g7]
-        2 pipeline model-parallel groups:
-            [g0, g2, g4, g6], [g1, g3, g5, g7]
-    Note that for efficiency, the caller should make sure adjacent ranks
-    are on the same DGX box. For example if we are using 2 DGX-1 boxes
-    with a total of 16 GPUs, rank 0 to 7 belong to the first box and
-    ranks 8 to 15 belong to the second box.
+    Thread-local 版本的初始化，并支持 role_name 作为不同阶段的隔离。
     """
-    # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
-    world_size: int = torch.distributed.get_world_size()
+    world_size = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
     if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
         raise RuntimeError(
-            f"world_size ({world_size}) is not equal to "
-            f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
-            f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
+            f"world_size ({world_size}) != tensor_model_parallel_size ({tensor_model_parallel_size}) x pipeline_model_parallel_size ({pipeline_model_parallel_size})"
         )
 
-    # Build the tensor model-parallel groups.
-    num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
-    global _TP
-    assert _TP is None, "tensor model parallel group is already initialized"
-    group_ranks = []
-    for i in range(num_tensor_model_parallel_groups):
-        ranks = list(
-            range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
-        )
-        group_ranks.append(ranks)
+    # TP groups
+    num_tp_groups = world_size // tensor_model_parallel_size
+    tp_group_ranks = []
+    for i in range(num_tp_groups):
+        ranks = list(range(i * tensor_model_parallel_size,
+                           (i + 1) * tensor_model_parallel_size))
+        tp_group_ranks.append(ranks)
 
-    # message queue broadcaster is only used in tensor model parallel group
-    _TP = init_model_parallel_group(
-        group_ranks,
+    tp_group = init_model_parallel_group(
+        tp_group_ranks,
         get_world_group().local_rank,
         backend,
-        use_message_queue_broadcaster=get_bool_env_var(
-            "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
-        ),
-        group_name="tp",
+        use_message_queue_broadcaster=get_bool_env_var("SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"),
+        group_name=f"tp_{role_name}",
     )
 
     if duplicate_tp_group:
-        global _PDMUX_PREFILL_TP_GROUP
-        assert (
-            _PDMUX_PREFILL_TP_GROUP is None
-        ), "tensor model parallel group for PD-Multiplexing Prefill is already initialized"
-        _PDMUX_PREFILL_TP_GROUP = init_model_parallel_group(
-            group_ranks,
+        pdmux_prefill_tp_group = init_model_parallel_group(
+            tp_group_ranks,
             get_world_group().local_rank,
             backend,
-            use_message_queue_broadcaster=get_bool_env_var(
-                "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
-            ),
-            group_name="pdmux_prefill_tp",
+            use_message_queue_broadcaster=get_bool_env_var("SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"),
+            group_name=f"pdmux_prefill_tp_{role_name}",
         )
-        _TP.pynccl_comm.disabled = False
-        _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
+        tp_group.pynccl_comm.disabled = False
+        pdmux_prefill_tp_group.pynccl_comm.disabled = False
 
+    # MoE EP groups
     moe_ep_size = expert_model_parallel_size
-
     moe_tp_size = tensor_model_parallel_size // moe_ep_size
-    global _MOE_EP
-    assert _MOE_EP is None, "expert model parallel group is already initialized"
-    group_ranks = []
-    for i in range(num_tensor_model_parallel_groups):
+    moe_ep_ranks = []
+    for i in range(num_tp_groups):
         for j in range(moe_tp_size):
             st = i * tensor_model_parallel_size + j
             en = (i + 1) * tensor_model_parallel_size + j
             ranks = list(range(st, en, moe_tp_size))
-            group_ranks.append(ranks)
+            moe_ep_ranks.append(ranks)
 
-    _MOE_EP = init_model_parallel_group(
-        group_ranks,
+    moe_ep_group = init_model_parallel_group(
+        moe_ep_ranks,
         get_world_group().local_rank,
         backend,
         use_custom_allreduce=False,
-        group_name="moe_ep",
+        group_name=f"moe_ep_{role_name}",
     )
 
-    global _MOE_TP
-    assert _MOE_TP is None, "expert model parallel group is already initialized"
-    group_ranks = []
-    for i in range(num_tensor_model_parallel_groups):
+    # MoE TP groups
+    moe_tp_ranks = []
+    for i in range(num_tp_groups):
         for j in range(moe_ep_size):
             st = i * tensor_model_parallel_size + j * moe_tp_size
             en = i * tensor_model_parallel_size + (j + 1) * moe_tp_size
             ranks = list(range(st, en))
-            group_ranks.append(ranks)
+            moe_tp_ranks.append(ranks)
 
-    _MOE_TP = init_model_parallel_group(
-        group_ranks,
+    moe_tp_group = init_model_parallel_group(
+        moe_tp_ranks,
         get_world_group().local_rank,
         backend,
         use_custom_allreduce=False,
-        group_name="moe_tp",
+        group_name=f"moe_tp_{role_name}",
     )
 
-    # Build the pipeline model-parallel groups.
-    num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
-    global _PP
-    assert _PP is None, "pipeline model parallel group is already initialized"
-    group_ranks = []
-    for i in range(num_pipeline_model_parallel_groups):
-        ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
-        group_ranks.append(ranks)
-    # pipeline parallel does not need custom allreduce
-    _PP = init_model_parallel_group(
-        group_ranks,
+    # Pipeline parallel groups
+    num_pp_groups = world_size // pipeline_model_parallel_size
+    pp_ranks = []
+    for i in range(num_pp_groups):
+        ranks = list(range(i, world_size, num_pp_groups))
+        pp_ranks.append(ranks)
+
+    pp_group = init_model_parallel_group(
+        pp_ranks,
         get_world_group().local_rank,
         backend,
         use_custom_allreduce=False,
-        group_name="pp",
+        group_name=f"pp_{role_name}",
     )
 
+    logger.info(f"Initialized model parallel groups for role '{role_name}'")
+    return tp_group, moe_ep_group, moe_tp_group, pp_group
 
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
