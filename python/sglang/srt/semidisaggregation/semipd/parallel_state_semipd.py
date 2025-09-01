@@ -6,17 +6,42 @@ Keep core sglang.srt.distributed.parallel_state intact; we only wrap its APIs.
 import threading
 import torch
 import logging
-
+import sglang.srt.distributed.parallel_state as core_ps
 logger = logging.getLogger(__name__)
 
 _SEMIPD_TP_DECODE = None
 _SEMIPD_TP_PREFILL = None
 _SEMIPD_TL = threading.local()
 
-
+@contextmanager
+def graph_capture(graph_capture_context: core_ps.Optional[core_ps.GraphCaptureContext] = None):
+    """
+    `graph_capture` is a context manager which should surround the code that
+    is capturing the CUDA graph. Its main purpose is to ensure that the
+    some operations will be run after the graph is captured, before the graph
+    is replayed. It returns a `GraphCaptureContext` object which contains the
+    necessary data for the graph capture. Currently, it only contains the
+    stream that the graph capture is running on. This stream is set to the
+    current CUDA stream when the context manager is entered and reset to the
+    default stream when the context manager is exited. This is to ensure that
+    the graph capture is running on a separate stream from the default stream,
+    in order to explicitly distinguish the kernels to capture
+    from other kernels possibly launched on background in the default stream.
+    """
+    if graph_capture_context is None:
+        with _SEMIPD_TP_DECODE.graph_capture() as context, core_ps.get_pp_group().graph_capture(
+            context
+        ):
+            yield context
+    else:
+        # Reuse the provided context (and its stream) across TP/PP
+        with _SEMIPD_TP_DECODE.graph_capture(graph_capture_context) as context, core_ps.get_pp_group().graph_capture(
+            context
+        ):
+            yield context
 
 def _get_tp_groups_from_core():
-    import sglang.srt.distributed.parallel_state as core_ps
+    
     # 在部分时序下，模型并行尚未完全初始化，这里只做“尝试获取”，由首次 get_tp_group 调用触发创建
     if not core_ps.model_parallel_is_initialized():
         return core_ps, None, torch.distributed.get_backend(torch.distributed.group.WORLD), []

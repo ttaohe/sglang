@@ -642,6 +642,7 @@ class ModelRunner:
                     get_tp_group_role_aware,
                 )
                 self.tp_group = get_tp_group_role_aware()
+                logging.info(f"semipd tp group initialized sucessed: {self.tp_group}")
             except Exception as e:
                 raise RuntimeError(f"semipd tp group initialization failed: {e}")
         else:
@@ -659,8 +660,9 @@ class ModelRunner:
                     get_attention_tp_group_role_aware,
                 )
                 self.attention_tp_group = get_attention_tp_group_role_aware(self.server_args)
-            except Exception:
-                self.attention_tp_group = get_attention_tp_group()
+                logging.info(f"semipd attention tp group initialized sucessed: {self.attention_tp_group}")
+            except Exception as e:
+                raise RuntimeError(f"semipd attention tp group initialization failed: {e}")
         else:
             self.attention_tp_group = get_attention_tp_group()
 

@@ -34,7 +34,6 @@ class SchedulerSemiPDMixin:
 
         if role == InstanceRole.DECODE:
             # Decode runs with overlap on the framework-selected decode stream
-            self.enable_overlap = True
             decode_stream = stream_group[1]
             decode_stream = torch.cuda.Stream()
             runner = (
@@ -45,8 +44,8 @@ class SchedulerSemiPDMixin:
             # Capture graphs on the selected stream without changing core code
             runner.init_cuda_graphs(decode_stream)
         elif role == InstanceRole.PREFILL:
+            pass
             # Prefill runs without overlap on the framework-selected prefill stream
-            self.enable_overlap = False
             # No cuda graph capture for prefill to keep behavior consistent
         else:
             logger.warning("Unknown instance_role for SemiPD; skip per-stream init")
