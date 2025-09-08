@@ -91,12 +91,6 @@ class SchedulerSemiPDLauncher:
         logger.info("Decode scheduler init finished.")
         # Attach shared state for inter-thread queues
         setattr(dscheduler, "shared_state", shared_state)
-        # Rebind mailboxes now that shared_state is attached
-        if hasattr(dscheduler, "rebind_ipc_channels_decode"):
-            try:
-                dscheduler.rebind_ipc_channels_decode()
-            except Exception:
-                logger.exception("Failed to rebind decode IPC channels")
 
         if dscheduler.enable_overlap:
             shared_state.decode_model_runner = dscheduler.tp_worker.worker.model_runner
@@ -153,12 +147,6 @@ class SchedulerSemiPDLauncher:
         logger.info("Prefill scheduler init finished.")
         # Attach shared state for inter-thread queues
         setattr(pscheduler, "shared_state", shared_state)
-        # Rebind mailboxes now that shared_state is attached
-        if hasattr(pscheduler, "rebind_ipc_channels_prefill"):
-            try:
-                pscheduler.rebind_ipc_channels_prefill()
-            except Exception:
-                logger.exception("Failed to rebind prefill IPC channels")
 
         # Delegate per-role forward stream binding to mixin
         pscheduler.init_forward_streams(instance_role.role)
