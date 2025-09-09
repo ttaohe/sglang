@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+import threading
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -88,7 +89,7 @@ from sglang.srt.mem_cache.allocator import (
 )
 
 # Import Semi-PD thread-safe allocators
-from sglang.srt.semidisaggregation.semipd.not_used_semi_token_to_kv_pool_allocator import (
+from python.sglang.srt.semidisaggregation.semipd.deprecated.not_used_semi_token_to_kv_pool_allocator import (
     SemiAscendPagedTokenToKVPoolAllocator,
     SemiPagedTokenToKVPoolAllocator,
     SemiSWATokenToKVPoolAllocator,
@@ -1873,6 +1874,7 @@ class ModelRunner:
             and self.cuda_graph_runner.can_run(forward_batch)
         )
         if can_run_cuda_graph:
+            logging.debug(f"thread name: {threading.current_thread().name} decode forward")
             ret = self.cuda_graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
@@ -1891,6 +1893,7 @@ class ModelRunner:
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         elif forward_batch.forward_mode.is_extend():
+            logging.debug(f"thread name: {threading.current_thread().name} prefill forward")
             ret = self.forward_extend(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
