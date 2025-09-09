@@ -89,12 +89,13 @@ from sglang.srt.mem_cache.allocator import (
 )
 
 # Import Semi-PD thread-safe allocators
-from python.sglang.srt.semidisaggregation.semipd.deprecated.not_used_semi_token_to_kv_pool_allocator import (
-    SemiAscendPagedTokenToKVPoolAllocator,
-    SemiPagedTokenToKVPoolAllocator,
-    SemiSWATokenToKVPoolAllocator,
-    SemiTokenToKVPoolAllocator,
-)
+# from python.sglang.srt.semidisaggregation.semipd.deprecated.not_used_semi_token_to_kv_pool_allocator import (
+#     SemiAscendPagedTokenToKVPoolAllocator,
+#     SemiPagedTokenToKVPoolAllocator,
+#     SemiSWATokenToKVPoolAllocator,
+#     SemiTokenToKVPoolAllocator,
+# )
+
 from sglang.srt.mem_cache.memory_pool import (
     AscendMLAPagedTokenToKVPool,
     AscendTokenToKVPool,
