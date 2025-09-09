@@ -3,6 +3,7 @@ import logging
 import os
 import signal
 import time
+import threading
 from http import HTTPStatus
 
 from types import SimpleNamespace
@@ -489,6 +490,8 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             self.bridge_socket = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_p_instance = SimpleNamespace(send_pyobj=lambda x: None)
 
+        self._stream_switch_enabled = True
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """
         Semi-PD changes:
@@ -564,6 +567,51 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             ret, _ = self.prepare_dp_attn_batch(ret)
 
         return ret
+
+    def start_stream_switch_monitoring(self):
+        """Start the background thread for dynamic stream switching."""
+        if not self._stream_switch_enabled:
+            return
+            
+        from .stream_sync_manager import stream_sync_manager
+        
+        # Register this scheduler with the sync manager
+        stream_sync_manager.register_schedulers(decode_scheduler=self)
+        stream_sync_manager.start_monitoring(self)
+        logger.info("Dynamic stream switching monitoring started via StreamSyncManager")
+
+    def _update_forward_stream(self):
+        """Update the forward stream after switching."""
+        try:
+            from .pdmux_context import get_current_stream_idx, get_stream_groups
+            
+            stream_idx = get_current_stream_idx()
+            stream_group = get_stream_groups()[stream_idx]
+            decode_stream = stream_group[1]
+            
+            # Update the forward stream
+            self.set_forward_stream(decode_stream)
+            
+            # Reinitialize CUDA graphs if needed
+            # runner = (
+            #     self.tp_worker.worker.model_runner
+            #     if hasattr(self.tp_worker, "worker")
+            #     else self.tp_worker.model_runner
+            # )
+            # runner.init_cuda_graphs()
+            
+            logger.info(f"Updated forward stream to {get_stream_group_name(stream_idx)} configuration")
+            
+        except Exception as e:
+            logger.error(f"Error updating forward stream: {e}")
+
+    def handle_generate_request(
+        self,
+        recv_req: TokenizedGenerateReqInput,
+    ):
+        """Override to update last request time."""
+        self._last_request_time = time.time()
+        super().handle_generate_request(recv_req)
 
     def get_new_batch_prefill(self, rids: List[str]) -> Optional[ScheduleBatch]:
         """

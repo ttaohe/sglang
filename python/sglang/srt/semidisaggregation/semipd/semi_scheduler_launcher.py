@@ -23,6 +23,8 @@ class SemiPDSchedulerSharedState:
     max_total_num_tokens: Optional[int] = None
     decode_model_runner: Optional[Any] = None
     decode_ready_event: td.Event = field(default_factory=td.Event)
+    stream_switch_event: td.Event = field(default_factory=td.Event)
+    current_stream_idx: int = 1  # Default to balanced
 
 
 
@@ -109,6 +111,10 @@ class SchedulerSemiPDLauncher:
         dscheduler.init_forward_streams(instance_role.role)
         shared_state.decode_ready_event.set()
 
+        # Start dynamic stream switching monitoring
+        if hasattr(dscheduler, 'start_stream_switch_monitoring'):
+            dscheduler.start_stream_switch_monitoring()
+
         logger.info("Decode scheduler initialized. Starting event loop...")
         if dscheduler.enable_overlap:
             dscheduler.event_loop_overlap()
@@ -161,5 +167,3 @@ class SchedulerSemiPDLauncher:
 
         logger.info("Prefill scheduler initialized. Starting event loop...")
         pscheduler.event_loop_normal()
-
-

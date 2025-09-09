@@ -1,14 +1,24 @@
 import torch
 from torch.cuda.streams import ExternalStream
 from typing import NamedTuple, Tuple
+import time
 
 import greenctx as gtx
 import logging
+
+from .stream_switch_config import (
+    STREAM_GROUP_BALANCED,
+    STREAM_GROUP_DECODE_HEAVY,
+    DEFAULT_STREAM_GROUP,
+)
 
 STREAM_GROUPS = []
 SM_RATIOS = []
 CURRENT_STREAM_IDX = 0
 CURRENT_STREAM_GROUP = None
+
+# Track last switch time for minimum interval enforcement
+_LAST_SWITCH_TIME = 0
 
 class SMAllocation(NamedTuple):
     sm_a: int
@@ -65,11 +75,68 @@ def get_stream_groups() -> list[tuple[ExternalStream, ExternalStream]]:
     return STREAM_GROUPS
 
 
-def get_sm_ratios() -> list[tuple[int, int]]:
-    """Get the SM counts."""
+def get_sm_ratios() -> list[tuple[float, float]]:
+    """Get the SM ratios."""
     return SM_RATIOS
 
 
 def get_current_stream_idx() -> int:
     """Get the current stream index."""
     return CURRENT_STREAM_IDX
+
+
+def can_switch_stream() -> bool:
+    """Check if enough time has passed since last switch."""
+    from .stream_switch_config import STREAM_SWITCH_MIN_INTERVAL
+    current_time = time.time()
+    return (current_time - _LAST_SWITCH_TIME) >= STREAM_SWITCH_MIN_INTERVAL
+
+
+def switch_to_decode_heavy():
+    """Switch to decode-heavy configuration."""
+    global _LAST_SWITCH_TIME
+    if can_switch_stream():
+        set_current_stream_idx(STREAM_GROUP_DECODE_HEAVY)
+        _LAST_SWITCH_TIME = time.time()
+        logging.info(f"Switched to decode-heavy stream group (index {STREAM_GROUP_DECODE_HEAVY})")
+        return True
+    return False
+
+
+def switch_to_balanced():
+    """Switch to balanced configuration."""
+    global _LAST_SWITCH_TIME
+    if can_switch_stream():
+        set_current_stream_idx(STREAM_GROUP_BALANCED)
+        _LAST_SWITCH_TIME = time.time()
+        logging.info(f"Switched to balanced stream group (index {STREAM_GROUP_BALANCED})")
+        return True
+    return False
+
+
+def get_prefill_stream():
+    """Get current prefill stream."""
+    return STREAM_GROUPS[CURRENT_STREAM_IDX][0]
+
+
+def get_decode_stream():
+    """Get current decode stream."""
+    return STREAM_GROUPS[CURRENT_STREAM_IDX][1]
+
+
+def get_stream_group_name(idx: int) -> str:
+    """Get human-readable name for stream group."""
+    from .stream_switch_config import (
+        STREAM_GROUP_BALANCED,
+        STREAM_GROUP_DECODE_HEAVY,
+        STREAM_GROUP_PREFILL_HEAVY,
+    )
+    
+    if idx == STREAM_GROUP_PREFILL_HEAVY:
+        return "prefill-heavy"
+    elif idx == STREAM_GROUP_BALANCED:
+        return "balanced"
+    elif idx == STREAM_GROUP_DECODE_HEAVY:
+        return "decode-heavy"
+    else:
+        return f"unknown-{idx}"
