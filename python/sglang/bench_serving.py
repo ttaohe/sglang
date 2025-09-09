@@ -520,6 +520,7 @@ async def async_request_sglang_generate(
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
                             continue
+                        # print(chunk_bytes)
 
                         chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
                         latency = time.perf_counter() - st

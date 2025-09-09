@@ -1737,6 +1737,7 @@ class Scheduler(
                         logits_output, next_token_ids, can_run_cuda_graph = (
                             self.tp_worker.forward_batch_generation(model_worker_batch)
                         )
+                    torch.cuda.synchronize(self.kernel_launch_stream)
                 else:
                     pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)

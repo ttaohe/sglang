@@ -1156,8 +1156,8 @@ class BatchRetractReqInput:
 
 @dataclass
 class BatchProcessPrefillResultReq:
-    next_token_ids: torch.Tensor
-    next_token_logits: torch.Tensor
+    next_token_ids: List[int]
+    next_token_logits: npt.NDArray[np.float32]
     pp_hidden_states_proxy_tensors:torch.Tensor
     can_run_cuda_graph:bool
 

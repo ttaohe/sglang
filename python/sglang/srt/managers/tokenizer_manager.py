@@ -983,10 +983,21 @@ class TokenizerManager:
         return await self._execute_profile(req)
 
     async def _execute_profile(self, req: ProfileReq):
-        result = (await self.profile_communicator(req))[0]
-        if not result.success:
-            raise RuntimeError(result.message)
-        return result
+        # result = (await self.profile_communicator(req))[0]
+        # if not result.success:
+        #     raise RuntimeError(result.message)
+        # return result
+        
+        # Semi-PD
+        results = await self.profile_communicator(req)
+        message = None
+        for result in results:
+            if not result.success:
+                message = result.message
+                break
+
+        if message is not None:
+            raise RuntimeError(message)
 
     async def start_expert_distribution_record(self):
         self.auto_create_handle_loop()

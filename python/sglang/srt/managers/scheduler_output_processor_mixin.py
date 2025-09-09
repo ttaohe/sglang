@@ -672,6 +672,15 @@ class SchedulerOutputProcessorMixin:
             if self.model_config.is_multimodal_gen:
                 return
 
+            # try:
+            #     logging.info(
+            #         "D Stream_output_generation n_reqs=%d, output_ids_lens=%s, ",
+            #         len(rids),
+            #         [len(x) for x in output_ids],
+            #     )
+            # except Exception:
+            #     pass
+
             self.send_to_detokenizer.send_pyobj(
                 BatchTokenIDOut(
                     rids,

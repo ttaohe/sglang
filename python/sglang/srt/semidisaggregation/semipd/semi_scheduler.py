@@ -428,14 +428,12 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             logging.debug("deal result prefill start")
             next_token_logits = result.logits_output.next_token_logits.cpu().numpy()
             logging.debug("deal result prefill finished")
-
         req = BatchProcessPrefillResultReq(
             next_token_ids=result.next_token_ids.tolist(),
             next_token_logits=next_token_logits,
             pp_hidden_states_proxy_tensors=result.pp_hidden_states_proxy_tensors,
             can_run_cuda_graph=result.can_run_cuda_graph,
         )
-
         self.send_to_d_instance.send_pyobj(req)
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReq):
