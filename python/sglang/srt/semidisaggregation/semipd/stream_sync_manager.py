@@ -131,21 +131,25 @@ class StreamSyncManager:
                     # Check for new activity
                     has_waiting_requests = len(decode_scheduler.waiting_queue) > 0
                     has_scheduled_prefill = len(decode_scheduler.scheduled_prefill_batches) > 0
+                    has_active_decode = not decode_scheduler.running_batch.is_empty()
                     
                     if has_waiting_requests or has_scheduled_prefill:
                         last_request_time = current_time
                     
                     # Check if we should switch to decode-heavy
+                    # Only switch when no active decode requests and no pending work
                     if (not has_waiting_requests and 
                         not has_scheduled_prefill and
+                        has_active_decode and
                         current_time - last_request_time >= STREAM_SWITCH_IDLE_TIMEOUT and
                         self._current_stream_idx != STREAM_GROUP_DECODE_HEAVY):
                         
                         self.switch_to_decode_heavy()
                     
                     # Check if we should switch back to balanced
-                    elif (has_waiting_requests and 
-                          self._current_stream_idx != STREAM_GROUP_BALANCED):
+                    elif (not has_active_decode or 
+                          (has_waiting_requests and self._current_stream_idx != STREAM_GROUP_BALANCED)
+                        ):
                         
                         self.switch_to_balanced()
                         

@@ -32,18 +32,25 @@ class SchedulerSemiPDMixin:
         stream_group = self.stream_groups[stream_idx]
 
         logging.info(f"current stream group: {stream_group}")
-
-        if role == InstanceRole.DECODE:
-            decode_stream = stream_group[1]
-            self.set_forward_stream(decode_stream)
-            runner = (
+        runner = (
                 self.tp_worker.worker.model_runner
                 if hasattr(self.tp_worker, "worker")
                 else self.tp_worker.model_runner
             )
+
+        if role == InstanceRole.DECODE:
+            decode_stream = stream_group[1]
+            self.set_forward_stream(decode_stream)
+            
+            with(torch.cuda.stream(decode_stream)):
+                runner.init_attention_backend()
+                
             runner.init_cuda_graphs()
         elif role == InstanceRole.PREFILL:
             prefill_stream = stream_group[0]
+            
+            with(torch.cuda.stream(prefill_stream)):
+                runner.init_attention_backend()
             self.set_forward_stream(prefill_stream)
 
         else:

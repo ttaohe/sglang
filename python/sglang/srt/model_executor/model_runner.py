@@ -360,8 +360,9 @@ class ModelRunner:
 
         if self.device == "cuda":
             self.init_cublas()
-            self.init_attention_backend()
+            # semipd 模式下应该延后在stream里做？
             if server_args.engine_mode == "normal":
+                self.init_attention_backend()
                 self.init_cuda_graphs()
         else:
             self.cuda_graph_runner = None
