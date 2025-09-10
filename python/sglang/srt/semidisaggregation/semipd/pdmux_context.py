@@ -44,8 +44,8 @@ def initialize_stream_groups(gpu_id: int):
     # for pd_multiplexing, Init stream_groups
     SM_RATIOS = [
         # (prefill_sm_ratio, decode_sm_ratio)
+        (0.9, 0.1),
         (0.8, 0.2),
-        (0.5, 0.5),
         (0.1, 0.9),
     ]
     STREAM_GROUPS = [

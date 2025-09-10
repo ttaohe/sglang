@@ -9,9 +9,9 @@ STREAM_SWITCH_MIN_INTERVAL = 30  # seconds: minimum time between switches
 STREAM_SWITCH_IMMEDIATE_RESPONSE = True  # bool: whether to immediately switch back when new requests arrive
 
 # Stream group indices
-STREAM_GROUP_BALANCED = 1  # 50% prefill, 50% decode
+STREAM_GROUP_BALANCED = 1  # 80% prefill, 20% decode
 STREAM_GROUP_DECODE_HEAVY = 2  # 10% prefill, 90% decode
-STREAM_GROUP_PREFILL_HEAVY = 0  # 80% prefill, 20% decode
+STREAM_GROUP_PREFILL_HEAVY = 0  # 90% prefill, 10% decode
 
 # Default stream group
 DEFAULT_STREAM_GROUP = STREAM_GROUP_BALANCED
