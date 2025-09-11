@@ -296,6 +296,14 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         else:
             self.send_to_d_instance = SimpleNamespace(send_pyobj=lambda x: None)
             self.bridge_socket = SimpleNamespace(recv_pyobj=lambda: None)
+
+        # Dynamic stream switching state
+        self._stream_switch_enabled = getattr(server_args, "engine_mode", "normal") == "semipd"
+        
+        # Register with stream sync manager
+        if self._stream_switch_enabled:
+            from .stream_sync_manager import stream_sync_manager
+            stream_sync_manager.register_schedulers(prefill_scheduler=self)
         
     
     
