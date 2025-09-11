@@ -39,7 +39,8 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     broadcast_pyobj, 
     get_zmq_socket,
-    is_cpu
+    is_cpu,
+    kill_itself_when_parent_died,
 )
 from sglang.utils import get_exception_traceback
 
@@ -859,20 +860,17 @@ def run_scheduler_process(
         prefix = f"TP {tp_rank}"
     else:
         prefix = f"DP{dp_rank} TP{tp_rank}"
-    if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
-        dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
     setproctitle.setproctitle(f"sglang::semi_pd_scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
+    kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
+
+    if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
+        dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
-
-    # --- Stream and State Initialization ---
-    pstream, dstream = SchedulerSemiPDLauncher.init_streams(
-        sm_prefill, sm_decode, tp_rank, engine_mode=getattr(server_args, "engine_mode", "normal"), gpu_id=gpu_id
-    )
     
     shared_state = SemiPDSchedulerSharedState()
 
