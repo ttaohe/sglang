@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 def biased_grouped_topk_ref_impl(scores, bias, num_expert_group, topk_group, topk):
     # Pure PyTorch reference to avoid implicit kernel paths and control compile modes.
-    # Logic mirrors biased_grouped_topk_impl without shared experts handling (set to 0 for bench).
+    # Logic mirrors biased_grouped_topk without shared experts handling (set to 0 for bench).
     # scores: [N, E], bias: [E]
     n, e = scores.shape
     scores_sig = scores.sigmoid()

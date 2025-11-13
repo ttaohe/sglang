@@ -2,7 +2,7 @@ import pytest
 import torch
 from sgl_kernel import moe_fused_gate
 
-from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
+from sglang.srt.layers.moe.topk import biased_grouped_topk
 
 
 @pytest.mark.parametrize(
@@ -48,7 +48,7 @@ def test_moe_fused_gate_combined(
         routed_scaling_factor=2.5,
         apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
     )
-    ref_output, ref_indices = biased_grouped_topk_impl(
+    ref_output, ref_indices = biased_grouped_topk(
         scores,
         scores,
         bias,
