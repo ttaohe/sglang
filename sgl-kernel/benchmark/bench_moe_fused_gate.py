@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 from sgl_kernel import moe_fused_gate
 
-from sglang.srt.layers.moe.topk import biased_grouped_topk
+from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
 
 # CI environment detection
 IS_CI = (
@@ -17,7 +17,7 @@ IS_CI = (
 
 
 def biased_grouped_topk_org(scores, bias, num_expert_group, topk_group, topk):
-    return biased_grouped_topk(
+    return biased_grouped_topk_impl(
         scores,
         scores,
         bias,
@@ -60,7 +60,8 @@ configs = [(sq,) for sq in seq_length_range]
 def benchmark(seq_length, provider):
     dtype = torch.float32
     device = torch.device("cuda")
-    num_experts, num_expert_group, topk_group, topk = 256, 8, 4, 8
+    # num_experts, num_expert_group, topk_group, topk = 256, 8, 4, 8
+    num_experts, num_expert_group, topk_group, topk = 384, 1, 1, 8 # kimi
 
     scores = torch.randn((seq_length, num_experts), device=device, dtype=dtype)
     bias = torch.rand(num_experts, device=device, dtype=dtype)
