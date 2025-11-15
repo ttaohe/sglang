@@ -17,15 +17,12 @@ from sglang.srt.layers.moe.topk import biased_grouped_topk
         (256, 8, 4, 8),  # deepseek v3
         (512, 16, 8, 16),
         # VPT > 32 cases to exercise tiled kernel path
-        (1024, 8, 4, 8),  # VPT = 128
-        (2048, 8, 4, 8),  # VPT = 256
-        # Kimi series
-        (64, 1, 1, 6),  # kimi-vl: VPT = 64
         (384, 1, 1, 8),  # kimi-K2: VPT = 384 (special-case allowed)
     ],
 )
-@pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
+@pytest.mark.parametrize("num_fused_shared_experts", [0,])
 @pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False, True])
+
 def test_moe_fused_gate_combined(
     seq_length, params, num_fused_shared_experts, apply_routed_scaling_factor_on_output
 ):

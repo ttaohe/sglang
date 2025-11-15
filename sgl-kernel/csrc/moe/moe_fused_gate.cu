@@ -10,7 +10,7 @@
 #include <type_traits>
 #include <vector>
 
-#include "moe_fused_gate_tiled.h"
+#include "sgl_kernel/moe/moe_fused_gate_tiled.h"
 template <typename T, int N>
 using AlignedArray = cutlass::AlignedArray<T, N>;
 using bfloat16_t = cutlass::bfloat16_t;
@@ -430,13 +430,17 @@ std::vector<at::Tensor> moe_fused_gate(
   switch (num_experts) {
     case 384:
       if (num_expert_group == 1) {
-        // Static tiled specialization for THREADS_PER_ROW==1
+        // Static tiled specialization for THREADS_PER_ROW==1.
+        // Note: dtype dispatch (bf16/fp16/fp32) is handled inside moe_fused_gate_tiled_static,
+        // so we do not branch on input.scalar_type() here.
         LAUNCH_MOE_GATE_TILED_CONFIG(384, 1, 32);
       }
       break;
     case 64:
       if (num_expert_group == 1) {
-        // Static tiled specialization for THREADS_PER_ROW==1
+        // Static tiled specialization for THREADS_PER_ROW==1.
+        // Note: dtype dispatch (bf16/fp16/fp32) is handled inside moe_fused_gate_tiled_static,
+        // so we do not branch on input.scalar_type() here.
         LAUNCH_MOE_GATE_TILED_CONFIG(64, 1, 32);
       }
       break;
@@ -484,7 +488,14 @@ std::vector<at::Tensor> moe_fused_gate(
   // If VPT exceeds native path (32), dispatch to tiled kernel which supports larger VPT
   if (computed_vpt > MAX_VPT) {
     return moe_fused_gate_tiled(
-        input, bias, num_expert_group, topk_group, topk, num_fused_shared_experts, routed_scaling_factor);
+        input,
+        bias,
+        num_expert_group,
+        topk_group,
+        topk,
+        num_fused_shared_experts,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output);
   }
   if (!dispatched) {
     // Fallback to the dynamic kernel if none of the supported combinations match.

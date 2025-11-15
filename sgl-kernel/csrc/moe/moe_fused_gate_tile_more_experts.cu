@@ -1,4 +1,14 @@
-// add support the number of group expert from the original 32 to 128/512 implemented with tiling
+//------------------------------------------------------------------------------
+// Tiled MoE Fused Gate (More Experts)
+//
+// Responsibilities:
+// - Provide tiled kernels to support larger experts-per-thread (VPT) beyond 32.
+// - Offer static specializations for common shapes (e.g., 384/64 experts with group=1).
+// - Perform dtype dispatch (bf16/fp16/fp32) inside the tiled launchers, so callers
+//   (e.g., moe_fused_gate.cu) do not need to branch on dtype.
+//
+// This file aligns its structure/comments with moe_fused_gate.cu for clarity.
+//------------------------------------------------------------------------------
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
@@ -17,11 +27,12 @@ using bfloat16_t = cutlass::bfloat16_t;
 using float16_t = cutlass::half_t;
 using float32_t = float;
 
+// Fixed kernel launch constants (kept consistent with moe_fused_gate.cu)
 static constexpr int WARP_SIZE = 32;
 static constexpr int WARPS_PER_CTA = 6;
 
-// Maximum experts per thread (VPT) we target via tiling
-// You can raise this to 512 if needed; performance and register pressure should be reassessed.
+// Maximum experts per thread (VPT) we target via tiling.
+// You can raise this to 512 if needed; reassess performance and register pressure before doing so.
 static constexpr int MAX_TILED_VPT = 512;
 static constexpr int TILE_VPT = 32; // tile size processed per thread per pass
 
@@ -51,6 +62,9 @@ __device__ inline float sigmoidf_approx(float x) {
   return 1.0f / (1.0f + __expf(-x));
 }
 
+//------------------------------------------------------------------------------
+// Dynamic Tiled Kernel Parameters
+//------------------------------------------------------------------------------
 struct KernelParamsDynamicTiled {
   int VPT;                // experts per thread (per group)
   int NUM_EXPERTS;        // total experts
@@ -89,6 +103,9 @@ __device__ inline void warp_argmax_pair(float &val, int &idx, int width) {
   }
 }
 
+//------------------------------------------------------------------------------
+// Dynamic Tiled Kernel
+//------------------------------------------------------------------------------
 template <typename T, int TILE>
 __global__ void moe_fused_gate_kernel_tiled(
     const void* __restrict__ input,
@@ -101,7 +118,8 @@ __global__ void moe_fused_gate_kernel_tiled(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
-    double routed_scaling_factor) {
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output) {
   KernelParamsDynamicTiled params;
   params.NUM_EXPERTS = static_cast<int>(num_experts);
   params.THREADS_PER_ROW = static_cast<int>(num_expert_group);
@@ -255,14 +273,17 @@ __global__ void moe_fused_gate_kernel_tiled(
     for (int i = 0; i < topk; ++i) {
       int64_t idx = topk * thread_row + i;
       output_ptr[idx] = output_ptr[idx] / denom;
+      if (apply_routed_scaling_factor_on_output) {
+        output_ptr[idx] *= routed_scaling_factor;
+      }
     }
   }
 }
 
-// ----------------------------------------------------------------------------
-// Static tiled kernel template (compile-time params). Currently supports
-// THREADS_PER_ROW == 1 path (no warp reductions). Can be extended later.
-// ----------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// Static Tiled Kernel Template (compile-time params)
+// Currently supports THREADS_PER_ROW == 1 path (no warp reductions).
+//------------------------------------------------------------------------------
 template <typename T,
           int NUM_EXPERTS,
           int THREADS_PER_ROW,
@@ -278,7 +299,8 @@ __global__ void moe_fused_gate_kernel_tiled_static(
     int64_t num_rows,
     int64_t topk,
     int64_t num_fused_shared_experts,
-    double routed_scaling_factor) {
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output) {
   static_assert(THREADS_PER_ROW == 1, "static tiled kernel currently supports THREADS_PER_ROW==1 only");
   (void)WARPS_PER_CTA_;
 
@@ -348,11 +370,49 @@ __global__ void moe_fused_gate_kernel_tiled_static(
     for (int i = 0; i < topk; ++i) {
       int64_t out_idx = topk * thread_row + i;
       output_ptr[out_idx] = output_ptr[out_idx] / real_sum;
+      if (apply_routed_scaling_factor_on_output) {
+        output_ptr[out_idx] *= static_cast<float>(routed_scaling_factor);
+      }
     }
   }
 }
 
-// Public dispatcher for static tiled instantiations
+//------------------------------------------------------------------------------
+// Host Launcher: Static Tiled Specializations
+// - Performs dtype dispatch internally (bf16/fp16/fp32).
+// - Special-cases common expert counts (384/64) with THREADS_PER_ROW==1.
+//------------------------------------------------------------------------------
+
+// Keep a launch macro similar in style to moe_fused_gate.cu
+#define LAUNCH_MOE_GATE_TILED_STATIC(TYPE, NUM_EXPERTS)                                                    \
+  do {                                                                                                     \
+    moe_fused_gate_kernel_tiled_static<                                                                     \
+        TYPE, NUM_EXPERTS, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA, TILE_VPT>          \
+        <<<num_blocks, block_dim, 0, stream>>>(                                                            \
+            input.data_ptr(),                                                                              \
+            bias.data_ptr(),                                                                               \
+            output.data_ptr<float>(),                                                                      \
+            indices.data_ptr<int32_t>(),                                                                   \
+            num_rows,                                                                                      \
+            topk,                                                                                          \
+            num_fused_shared_experts,                                                                      \
+            routed_scaling_factor,                                                                          \
+            apply_routed_scaling_factor_on_output);                                                         \
+  } while (0)
+
+#define LAUNCH_MOE_GATE_TILED_STATIC_BY_DTYPE(NUM_EXPERTS)                                                 \
+  do {                                                                                                     \
+    if (input.scalar_type() == at::kBFloat16) {                                                            \
+      LAUNCH_MOE_GATE_TILED_STATIC(bfloat16_t, NUM_EXPERTS);                                               \
+    } else if (input.scalar_type() == at::kHalf) {                                                         \
+      LAUNCH_MOE_GATE_TILED_STATIC(float16_t, NUM_EXPERTS);                                                \
+    } else if (input.scalar_type() == at::kFloat) {                                                        \
+      LAUNCH_MOE_GATE_TILED_STATIC(float32_t, NUM_EXPERTS);                                                \
+    } else {                                                                                               \
+      TORCH_CHECK(false, "Unsupported dtype for moe_fused_gate_tiled_static");                             \
+    }                                                                                                      \
+  } while (0)
+
 std::vector<at::Tensor> moe_fused_gate_tiled_static(
     at::Tensor& input,
     at::Tensor& bias,
@@ -360,7 +420,8 @@ std::vector<at::Tensor> moe_fused_gate_tiled_static(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
-    double routed_scaling_factor) {
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output) {
   TORCH_CHECK(input.is_cuda(), "input must be CUDA tensor");
   TORCH_CHECK(bias.is_cuda(), "bias must be CUDA tensor");
   int64_t num_rows = input.size(0);
@@ -373,7 +434,8 @@ std::vector<at::Tensor> moe_fused_gate_tiled_static(
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   dim3 block_dim(WARP_SIZE, WARPS_PER_CTA);
 
-  // Currently: specialize THREADS_PER_ROW=1 for selected NUM_EXPERTS with TILE=32
+  // Currently: specialize THREADS_PER_ROW=1 for selected NUM_EXPERTS with TILE=32.
+  // Note: dtype dispatch is handled here (see if/else chain below).
   if (num_experts == 384 && num_expert_group == 1) {
     constexpr int THREADS_PER_ROW = 1;
     constexpr int ROWS_PER_WARP = WARP_SIZE / THREADS_PER_ROW;
@@ -381,25 +443,7 @@ std::vector<at::Tensor> moe_fused_gate_tiled_static(
     int64_t rows_per_warp = ROWS_PER_WARP;
     int64_t num_warps = (num_rows + rows_per_warp - 1) / rows_per_warp;
     int64_t num_blocks = (num_warps + WARPS_PER_CTA - 1) / WARPS_PER_CTA;
-
-    if (input.scalar_type() == at::kBFloat16) {
-      moe_fused_gate_kernel_tiled_static<bfloat16_t, 384, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA, TILE_VPT>
-          <<<num_blocks, block_dim, 0, stream>>>(
-              input.data_ptr(), bias.data_ptr(), output.data_ptr<float>(), indices.data_ptr<int32_t>(),
-              num_rows, topk, num_fused_shared_experts, routed_scaling_factor);
-    } else if (input.scalar_type() == at::kHalf) {
-      moe_fused_gate_kernel_tiled_static<float16_t, 384, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA, TILE_VPT>
-          <<<num_blocks, block_dim, 0, stream>>>(
-              input.data_ptr(), bias.data_ptr(), output.data_ptr<float>(), indices.data_ptr<int32_t>(),
-              num_rows, topk, num_fused_shared_experts, routed_scaling_factor);
-    } else if (input.scalar_type() == at::kFloat) {
-      moe_fused_gate_kernel_tiled_static<float32_t, 384, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA, TILE_VPT>
-          <<<num_blocks, block_dim, 0, stream>>>(
-              input.data_ptr(), bias.data_ptr(), output.data_ptr<float>(), indices.data_ptr<int32_t>(),
-              num_rows, topk, num_fused_shared_experts, routed_scaling_factor);
-    } else {
-      TORCH_CHECK(false, "Unsupported dtype for moe_fused_gate_tiled_static");
-    }
+    LAUNCH_MOE_GATE_TILED_STATIC_BY_DTYPE(384);
   } else if (num_experts == 64 && num_expert_group == 1) {
     constexpr int THREADS_PER_ROW = 1;
     constexpr int ROWS_PER_WARP = WARP_SIZE / THREADS_PER_ROW;
@@ -407,25 +451,7 @@ std::vector<at::Tensor> moe_fused_gate_tiled_static(
     int64_t rows_per_warp = ROWS_PER_WARP;
     int64_t num_warps = (num_rows + rows_per_warp - 1) / rows_per_warp;
     int64_t num_blocks = (num_warps + WARPS_PER_CTA - 1) / WARPS_PER_CTA;
-
-    if (input.scalar_type() == at::kBFloat16) {
-      moe_fused_gate_kernel_tiled_static<bfloat16_t, 64, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA, TILE_VPT>
-          <<<num_blocks, block_dim, 0, stream>>>(
-              input.data_ptr(), bias.data_ptr(), output.data_ptr<float>(), indices.data_ptr<int32_t>(),
-              num_rows, topk, num_fused_shared_experts, routed_scaling_factor);
-    } else if (input.scalar_type() == at::kHalf) {
-      moe_fused_gate_kernel_tiled_static<float16_t, 64, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA, TILE_VPT>
-          <<<num_blocks, block_dim, 0, stream>>>(
-              input.data_ptr(), bias.data_ptr(), output.data_ptr<float>(), indices.data_ptr<int32_t>(),
-              num_rows, topk, num_fused_shared_experts, routed_scaling_factor);
-    } else if (input.scalar_type() == at::kFloat) {
-      moe_fused_gate_kernel_tiled_static<float32_t, 64, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA, TILE_VPT>
-          <<<num_blocks, block_dim, 0, stream>>>(
-              input.data_ptr(), bias.data_ptr(), output.data_ptr<float>(), indices.data_ptr<int32_t>(),
-              num_rows, topk, num_fused_shared_experts, routed_scaling_factor);
-    } else {
-      TORCH_CHECK(false, "Unsupported dtype for moe_fused_gate_tiled_static");
-    }
+    LAUNCH_MOE_GATE_TILED_STATIC_BY_DTYPE(64);
   } else {
     TORCH_CHECK(false, "moe_fused_gate_tiled_static: unsupported combination");
   }
@@ -433,8 +459,11 @@ std::vector<at::Tensor> moe_fused_gate_tiled_static(
   return {output, indices};
 }
 
-// Host launcher for tiled kernel. This does not auto-wire into the existing `moe_fused_gate` API.
-// Call this from the dispatcher when VPT > 32 and <= MAX_TILED_VPT.
+//------------------------------------------------------------------------------
+// Host Launcher: Dynamic Tiled (VPT > 32 up to MAX_TILED_VPT)
+// - Performs dtype dispatch internally (bf16/fp16/fp32).
+// - This is invoked when the native kernel cannot handle VPT > 32.
+//------------------------------------------------------------------------------
 std::vector<at::Tensor> moe_fused_gate_tiled(
     at::Tensor& input,
     at::Tensor& bias,
@@ -442,7 +471,8 @@ std::vector<at::Tensor> moe_fused_gate_tiled(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
-    double routed_scaling_factor) {
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output) {
   TORCH_CHECK(input.is_cuda(), "input must be CUDA tensor");
   TORCH_CHECK(bias.is_cuda(), "bias must be CUDA tensor");
   int64_t num_rows = input.size(0);
@@ -480,7 +510,8 @@ std::vector<at::Tensor> moe_fused_gate_tiled(
         topk_group,
         topk,
         num_fused_shared_experts,
-        routed_scaling_factor);
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output);
   } else if (input.scalar_type() == at::kHalf) {
     moe_fused_gate_kernel_tiled<float16_t, TILE_VPT><<<num_blocks, block_dim, 0, stream>>>(
         input.data_ptr(),
@@ -493,7 +524,8 @@ std::vector<at::Tensor> moe_fused_gate_tiled(
         topk_group,
         topk,
         num_fused_shared_experts,
-        routed_scaling_factor);
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output);
   } else if (input.scalar_type() == at::kFloat) {
     moe_fused_gate_kernel_tiled<float32_t, TILE_VPT><<<num_blocks, block_dim, 0, stream>>>(
         input.data_ptr(),
@@ -506,7 +538,8 @@ std::vector<at::Tensor> moe_fused_gate_tiled(
         topk_group,
         topk,
         num_fused_shared_experts,
-        routed_scaling_factor);
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output);
   } else {
     TORCH_CHECK(false, "Unsupported data type for moe_fused_gate_tiled");
   }
