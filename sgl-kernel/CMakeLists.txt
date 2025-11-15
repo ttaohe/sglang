@@ -198,6 +198,44 @@ list(APPEND SGL_KERNEL_CUDA_FLAGS
     "--threads=${SGL_KERNEL_COMPILE_THREADS}"
 )
 
+option(SGL_KERNEL_ONLY_SM86 "Build only for sm_86 (skip SM90/SM100/TMA-related kernels and flags)" OFF)
+
+if (SGL_KERNEL_ONLY_SM86)
+    # Force-disable features/arches that are not applicable to SM86-only build
+    set(ENABLE_BELOW_SM90 OFF)
+    set(SGL_KERNEL_ENABLE_SM100A OFF)
+    set(SGL_KERNEL_ENABLE_FA3 OFF)
+
+    # Override CUDA flags to target only SM86, keeping the same style/diagnostics flags
+    set(SGL_KERNEL_CUDA_FLAGS
+        "-DNDEBUG"
+        "-DOPERATOR_NAMESPACE=sgl-kernel"
+        "-O3"
+        "-Xcompiler"
+        "-fPIC"
+        "-gencode=arch=compute_86,code=sm_86"
+        "-std=c++17"
+        "-DFLASHINFER_ENABLE_F16"
+        "-DCUTE_USE_PACKED_TUPLE=1"
+        "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1"
+        "-DCUTLASS_VERSIONS_GENERATED"
+        "-DCUTLASS_TEST_LEVEL=0"
+        "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1"
+        "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
+        "--expt-relaxed-constexpr"
+        "--expt-extended-lambda"
+        "-Xcompiler=-Wno-clang-format-violations"
+        "-Xcompiler=-Wno-conversion"
+        "-Xcompiler=-Wno-deprecated-declarations"
+        "-Xcompiler=-Wno-terminate"
+        "-Xcompiler=-Wfatal-errors"
+        "-Xcompiler=-ftemplate-backtrace-limit=1"
+        "-Xcudafe=--diag_suppress=177"
+        "-Xcudafe=--diag_suppress=2361"
+        "--threads=${SGL_KERNEL_COMPILE_THREADS}"
+    )
+endif()
+
 option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
 option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
@@ -219,7 +257,7 @@ if (SGL_KERNEL_ENABLE_FP8)
     )
 endif()
 
-if (ENABLE_BELOW_SM90)
+if (ENABLE_BELOW_SM90 AND NOT SGL_KERNEL_ONLY_SM86)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_80,code=sm_80"
         "-gencode=arch=compute_89,code=sm_89"
@@ -232,7 +270,7 @@ if (ENABLE_BELOW_SM90)
 
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+if (NOT SGL_KERNEL_ONLY_SM86 AND ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A))
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
         "-gencode=arch=compute_120a,code=sm_120a"
@@ -258,7 +296,7 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     endif()
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
+if (NOT SGL_KERNEL_ONLY_SM86 AND ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4"))
     set(SGL_KERNEL_ENABLE_FA3 ON)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
@@ -332,7 +370,6 @@ set(SOURCES
     "csrc/moe/moe_sum.cu"
     "csrc/moe/moe_sum_reduce.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
-    "csrc/moe/nvfp4_blockwise_moe.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
 
@@ -356,6 +393,18 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
+# Remove NVFP4 sources in SM86-only build to avoid SM90/SM100/TMA dependencies
+if (SGL_KERNEL_ONLY_SM86 OR NOT SGL_KERNEL_ENABLE_FP4)
+    list(REMOVE_ITEM SOURCES
+        "csrc/gemm/nvfp4_expert_quant.cu"
+        "csrc/gemm/nvfp4_quant_entry.cu"
+        "csrc/gemm/nvfp4_quant_kernels.cu"
+        "csrc/gemm/nvfp4_scaled_mm_entry.cu"
+        "csrc/gemm/nvfp4_scaled_mm_kernels.cu"
+        "csrc/moe/nvfp4_blockwise_moe.cu"
+    )
+endif()
+
 set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
@@ -367,33 +416,49 @@ set(INCLUDES
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
 
-# =========================== Common SM90 Build ============================= #
-# Build SM90 library with fast math optimization (same namespace, different directory)
-Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+if (SGL_KERNEL_ONLY_SM86)
+    # =========================== Common SM86 Build ============================= #
+    # Build SM86-only library (no TMA/SM90/SM100 features)
+    Python_add_library(common_ops_sm86_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
-target_compile_options(common_ops_sm90_build PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
-)
-target_include_directories(common_ops_sm90_build PRIVATE ${INCLUDES})
-# Set output name and separate build directory to avoid conflicts
-set_target_properties(common_ops_sm90_build PROPERTIES
-    OUTPUT_NAME "common_ops"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
-)
+    target_compile_options(common_ops_sm86_build PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
+    )
+    target_include_directories(common_ops_sm86_build PRIVATE ${INCLUDES})
+    # Set output name and separate build directory to avoid conflicts
+    set_target_properties(common_ops_sm86_build PROPERTIES
+        OUTPUT_NAME "common_ops"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm86"
+    )
+else()
+    # =========================== Common SM90 Build ============================= #
+    # Build SM90 library with fast math optimization (same namespace, different directory)
+    Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
-# =========================== Common SM100+ Build ============================= #
-# Build SM100+ library with precise math (same namespace, different directory)
-Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+    target_compile_options(common_ops_sm90_build PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
+    )
+    target_include_directories(common_ops_sm90_build PRIVATE ${INCLUDES})
+    # Set output name and separate build directory to avoid conflicts
+    set_target_properties(common_ops_sm90_build PROPERTIES
+        OUTPUT_NAME "common_ops"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
+    )
 
-target_compile_options(common_ops_sm100_build PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
-)
-target_include_directories(common_ops_sm100_build PRIVATE ${INCLUDES})
-# Set output name and separate build directory to avoid conflicts
-set_target_properties(common_ops_sm100_build PROPERTIES
-    OUTPUT_NAME "common_ops"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
-)
+    # =========================== Common SM100+ Build ============================= #
+    # Build SM100+ library with precise math (same namespace, different directory)
+    Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+
+    target_compile_options(common_ops_sm100_build PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
+    )
+    target_include_directories(common_ops_sm100_build PRIVATE ${INCLUDES})
+    # Set output name and separate build directory to avoid conflicts
+    set_target_properties(common_ops_sm100_build PROPERTIES
+        OUTPUT_NAME "common_ops"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
+    )
+endif()
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 execute_process(
@@ -420,31 +485,49 @@ add_subdirectory(
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
 )
 
-target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
-target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+if (SGL_KERNEL_ONLY_SM86)
+    target_link_libraries(common_ops_sm86_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+else()
+    target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+    target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+endif()
 
 # sparse flash attention
-target_compile_definitions(common_ops_sm90_build PRIVATE
-    FLASHATTENTION_DISABLE_BACKWARD
-    FLASHATTENTION_DISABLE_DROPOUT
-    FLASHATTENTION_DISABLE_UNEVEN_K
-)
-target_compile_definitions(common_ops_sm100_build PRIVATE
-    FLASHATTENTION_DISABLE_BACKWARD
-    FLASHATTENTION_DISABLE_DROPOUT
-    FLASHATTENTION_DISABLE_UNEVEN_K
-)
+if (SGL_KERNEL_ONLY_SM86)
+    target_compile_definitions(common_ops_sm86_build PRIVATE
+        FLASHATTENTION_DISABLE_BACKWARD
+        FLASHATTENTION_DISABLE_DROPOUT
+        FLASHATTENTION_DISABLE_UNEVEN_K
+    )
+else()
+    target_compile_definitions(common_ops_sm90_build PRIVATE
+        FLASHATTENTION_DISABLE_BACKWARD
+        FLASHATTENTION_DISABLE_DROPOUT
+        FLASHATTENTION_DISABLE_UNEVEN_K
+    )
+    target_compile_definitions(common_ops_sm100_build PRIVATE
+        FLASHATTENTION_DISABLE_BACKWARD
+        FLASHATTENTION_DISABLE_DROPOUT
+        FLASHATTENTION_DISABLE_UNEVEN_K
+    )
+endif()
 
 # Install to different subdirectories
 # CMake will find the built libraries in their respective LIBRARY_OUTPUT_DIRECTORY locations
 # and install them to the specified destinations
-install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
-install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
+if (SGL_KERNEL_ONLY_SM86)
+    install(TARGETS common_ops_sm86_build LIBRARY DESTINATION sgl_kernel/sm86)
+    # Also install a fallback copy at sgl_kernel/common_ops.* to satisfy older loaders
+    install(TARGETS common_ops_sm86_build LIBRARY DESTINATION sgl_kernel)
+else()
+    install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
+    install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
+endif()
 
 # ============================ Optional Install: FA3 ============================= #
 # set flash-attention sources file
 # Now FA3 support sm80/sm86/sm90
-if (SGL_KERNEL_ENABLE_FA3)
+if (SGL_KERNEL_ENABLE_FA3 AND NOT SGL_KERNEL_ONLY_SM86)
     set(SGL_FLASH_KERNEL_CUDA_FLAGS
         "-DNDEBUG"
         "-DOPERATOR_NAMESPACE=sgl-kernel"
@@ -597,7 +680,7 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
 
 # ============================ Extra Install: FA4 ============================= #
 # TODO: find a better install condition.
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+if (NOT SGL_KERNEL_ONLY_SM86 AND ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A))
     # flash_attn/cute
     install(DIRECTORY "${repo-flash-attention-origin_SOURCE_DIR}/flash_attn/cute/"
             DESTINATION "flash_attn/cute"
